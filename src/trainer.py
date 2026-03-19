@@ -1,5 +1,7 @@
 
 import os
+import json
+import time
 from metrics import *
 from utils import *
 from model import Att_Diffuse_model
@@ -41,10 +43,13 @@ def choose_model(args):
     device = args.device
     if args.model in ['diffurec','adrec','dreamrec']:
         if args.model == 'adrec':
-            # args.pcgrad=True
-            args.pretrained=True
-            args.freeze_emb=True
-            pass
+            if args.disable_adrec_pretrained:
+                args.pretrained = False
+                args.freeze_emb = False
+                args.embedding_warmup_epochs = 0
+            else:
+                args.pretrained = True
+                args.freeze_emb = True
         if args.model == 'diffurec':
             args.split_onebyone=True
             args.parallel_ag = False
@@ -70,6 +75,55 @@ def load_data(args):
 
     return tra_data_loader, val_data_loader, test_data_loader
 
+
+def is_cuda_device(device):
+    return isinstance(device, str) and device.startswith('cuda') and torch.cuda.is_available()
+
+
+def sync_cuda_if_needed(device):
+    if is_cuda_device(device):
+        torch.cuda.synchronize(device)
+
+
+def count_parameters(module):
+    total = sum(param.numel() for param in module.parameters())
+    trainable = sum(param.numel() for param in module.parameters() if param.requires_grad)
+    return total, trainable
+
+
+def build_efficiency_report(model_joint, args):
+    diffu_net = getattr(getattr(model_joint, 'diffu', None), 'net', None)
+    decoder = getattr(diffu_net, 'decoder', None)
+    total_params, trainable_params = count_parameters(model_joint)
+    if diffu_net is None:
+        diffusion_net_params, diffusion_net_trainable_params = 0, 0
+    else:
+        diffusion_net_params, diffusion_net_trainable_params = count_parameters(diffu_net)
+    if decoder is None:
+        decoder_params, decoder_trainable_params = 0, 0
+    else:
+        decoder_params, decoder_trainable_params = count_parameters(decoder)
+    return {
+        'dif_decoder': args.dif_decoder,
+        'total_params': total_params,
+        'trainable_params': trainable_params,
+        'diffusion_net_params': diffusion_net_params,
+        'diffusion_net_trainable_params': diffusion_net_trainable_params,
+        'decoder_params': decoder_params,
+        'decoder_trainable_params': decoder_trainable_params,
+        'epoch_efficiency': [],
+    }
+
+
+def save_efficiency_report(report, args, train_time):
+    saved_dir = os.path.join('saved', args.model, args.dataset)
+    if not os.path.exists(saved_dir):
+        os.makedirs(saved_dir)
+    report_path = os.path.join(saved_dir, str(train_time) + args.description + '_efficiency.json')
+    with open(report_path, 'w', encoding='utf-8') as file_obj:
+        json.dump(report, file_obj, indent=2)
+    return report_path
+
 def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, args, logger,train_time):
     epochs = args.epochs
     device = args.device
@@ -82,19 +136,31 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
     best_epoch = {'Best_epoch_HR@5': 0, 'Best_epoch_NDCG@5': 0, 'Best_epoch_HR@10': 0, 'Best_epoch_NDCG@10': 0, 'Best_epoch_HR@20': 0, 'Best_epoch_NDCG@20': 0}
     bad_count = 0
     best_model = None
+    efficiency_report = build_efficiency_report(model_joint, args)
+    logger.info(f"Model efficiency summary: {efficiency_report}")
     for epoch_temp in range(epochs):
         model_joint.train()
-        if epoch_temp ==5 and args.model =='adrec':
+        if (
+            args.model == 'adrec'
+            and args.embedding_warmup_epochs > 0
+            and epoch_temp == args.embedding_warmup_epochs
+        ):
             print(f'warm up finishied in epoch {epoch_temp}')
             logger.info(f'warm up finishied in epoch {epoch_temp}')
             model_joint.item_embedding.weight.requires_grad = True
         ce_losses = []
         dif_losses = []
         flag_update = 0
+        epoch_samples = 0
+        if is_cuda_device(device):
+            torch.cuda.reset_peak_memory_stats(device)
+        sync_cuda_if_needed(device)
+        epoch_start_time = time.perf_counter()
         pbr_train = tqdm(enumerate(tra_data_loader),desc='Epoch: {}'.format(epoch_temp),leave=False, total=len(tra_data_loader))
         # print('len',len(tra_data_loader))
         for index_temp, train_batch in pbr_train:
             train_batch = [x.to(device) for x in train_batch]
+            epoch_samples += train_batch[0].shape[0]
             optimizer.zero_grad()
             out_seq, last_item, *dif_loss = model_joint(train_batch[0], train_batch[1], train_flag=True)
             if len(dif_loss)>0:
@@ -116,8 +182,32 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             # if index_temp % int(len(tra_data_loader) / 5 + 1) == 0:
             #     print('[%d/%d] Loss: %.4f' % (index_temp, len(tra_data_loader), loss_all[-1]))
             #     logger.info('[%d/%d] Loss: %.4f' % (index_temp, len(tra_data_loader), loss_all[-1]))
+        sync_cuda_if_needed(device)
+        epoch_time = time.perf_counter() - epoch_start_time
+        avg_step_time = epoch_time / max(len(tra_data_loader), 1)
+        samples_per_sec = epoch_samples / max(epoch_time, 1e-12)
+        peak_memory_mb = 0.0
+        if is_cuda_device(device):
+            peak_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
         print(f"loss in epoch {epoch_temp}: ce_loss {sum(ce_losses)/len(ce_losses):.3f}, dif_loss {sum(dif_losses)/len(dif_losses):.3f}")
         logger.info(f"loss in epoch {epoch_temp}: ce_loss {sum(ce_losses)/len(ce_losses):.3f}, dif_loss {sum(dif_losses)/len(dif_losses):.3f}")
+        logger.info(
+            "epoch %d efficiency: epoch_time_sec=%.4f avg_step_time_sec=%.6f samples_per_sec=%.4f peak_gpu_mem_mb=%.2f",
+            epoch_temp,
+            epoch_time,
+            avg_step_time,
+            samples_per_sec,
+            peak_memory_mb,
+        )
+        efficiency_report['epoch_efficiency'].append(
+            {
+                'epoch': epoch_temp,
+                'epoch_time_sec': epoch_time,
+                'avg_step_time_sec': avg_step_time,
+                'samples_per_sec': samples_per_sec,
+                'peak_gpu_mem_mb': peak_memory_mb,
+            }
+        )
         lr_scheduler.step()
         # if epoch_temp == 10:
         #     args.eval_interval=3
@@ -184,13 +274,27 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
     logger.info('start testing: {}'.format(datetime.datetime.now()))
     top_100_item = []
     model_joint.eval()
+    inference_latencies = []
+    scoring_latencies = []
+    denoise_latencies = []
     with torch.no_grad():
         test_metrics_dict = {'HR@5': [], 'NDCG@5': [], 'HR@10': [], 'NDCG@10': [], 'HR@20': [], 'NDCG@20': []}
         test_metrics_dict_mean = {}
         for test_batch in tqdm(test_data_loader,leave=False):
             test_batch = [x.to(device) for x in test_batch]
-            out_seq, last_item, *_ = best_model(test_batch[0], test_batch[1], train_flag=False)
+            sync_cuda_if_needed(device)
+            full_batch_start_time = time.perf_counter()
+            sync_cuda_if_needed(device)
+            denoise_start_time = time.perf_counter()
+            out_seq, last_item = best_model.denoise_sample_only(test_batch[0], test_batch[1])
+            sync_cuda_if_needed(device)
+            denoise_latencies.append(time.perf_counter() - denoise_start_time)
+            sync_cuda_if_needed(device)
+            score_start_time = time.perf_counter()
             scores_rec_diffu = best_model.calculate_score(last_item)   ### Inner Production
+            sync_cuda_if_needed(device)
+            scoring_latencies.append(time.perf_counter() - score_start_time)
+            inference_latencies.append(time.perf_counter() - full_batch_start_time)
             # scores_rec_diffu = best_model.routing_rep_pre(rep_diffu)   ### routing
 
             _, indices = torch.topk(scores_rec_diffu, k=20)
@@ -213,6 +317,18 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
     logger.info(best_metrics_dict)
     logger.info(best_epoch)
     print(args)
+
+    if inference_latencies:
+        efficiency_report['test_inference_avg_batch_latency_sec'] = float(np.mean(inference_latencies))
+        efficiency_report['test_inference_p95_batch_latency_sec'] = float(np.percentile(inference_latencies, 95))
+    if denoise_latencies:
+        efficiency_report['test_denoise_avg_batch_latency_sec'] = float(np.mean(denoise_latencies))
+        efficiency_report['test_denoise_p95_batch_latency_sec'] = float(np.percentile(denoise_latencies, 95))
+    if scoring_latencies:
+        efficiency_report['test_scoring_avg_batch_latency_sec'] = float(np.mean(scoring_latencies))
+        efficiency_report['test_scoring_p95_batch_latency_sec'] = float(np.percentile(scoring_latencies, 95))
+    report_path = save_efficiency_report(efficiency_report, args, train_time)
+    logger.info(f"Efficiency report saved to {report_path}")
 
 
 

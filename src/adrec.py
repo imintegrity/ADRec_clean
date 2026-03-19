@@ -4,17 +4,21 @@ import torch.nn.functional as F
 from common import SiLU, TransformerEncoder
 from utils import _extract_into_tensor,exponential_mapping
 from step_sample import *
+from mamba_denoiser import MambaDenoiser
 
 class DenoisedModel(nn.Module):
     def __init__(self, args):
         super(DenoisedModel, self).__init__()
         self.hidden_size = args.hidden_size
+        self.decoder_type = args.dif_decoder
         if args.dif_decoder =='mlp':
             self.decoder = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size * 4),
                                         SiLU(),
                                         nn.Linear(self.hidden_size * 4, self.hidden_size),
                                         nn.LayerNorm(self.hidden_size),
                                         )
+        elif args.dif_decoder == 'mamba':
+            self.decoder = MambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2))
         else:
             self.decoder = TransformerEncoder(args,num_blocks=2,norm_first=False,hidden_size=self.hidden_size)
 
@@ -63,7 +67,7 @@ class DenoisedModel(nn.Module):
 
         rep_diffu = rep_item + lambda_uncertainty * (x_t + time_emb)
 
-        if isinstance(self.decoder, nn.Sequential):
+        if self.decoder_type == 'mlp':
             # 如果是 MLP，直接应用
             rep_diffu = self.decoder(rep_diffu)
         else:

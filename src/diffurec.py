@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from common import *
 from utils import _extract_into_tensor,exponential_mapping
 from step_sample import *
-from torchtune.modules import RotaryPositionalEmbeddings
 
 class Diffu_xstart(nn.Module):
     def __init__(self, args):

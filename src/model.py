@@ -129,26 +129,19 @@ class Att_Diffuse_model(nn.Module):
         rep_gt = self.item_embedding(labels).squeeze(1)
         return torch.sqrt(self.loss_mse(rep_gt, rep_diffu))
 
-    def forward(self, sequence, tag, train_flag=True):
-        # seq_length = sequence.size(1)
-        # position_ids = torch.arange(sequence.shape[1], dtype=torch.long, device=sequence.device)
-        # position_ids = position_ids.unsqueeze(0).expand_as(sequence)
-        # position_embeddings = self.position_embeddings(position_ids)
-
+    def prepare_inputs(self, sequence, tag):
         item_embeddings = self.item_embedding(sequence)
         tag_embeddings = self.item_embedding(tag)
         if self.geodesic:
             tag_embeddings = F.normalize(tag_embeddings,p=2, dim=-1)
-        # tag_embeddings = F.normalize(tag_embeddings,p=2, dim=-1)
-        # position_embeddings = self.position_embeddings(item_embeddings)
-        item_embeddings = self.embed_dropout(item_embeddings)  ## dropout first than layernorm
-        # item_embeddings = item_embeddings + position_embeddings
+        item_embeddings = self.embed_dropout(item_embeddings)
         item_embeddings = self.hist_norm(item_embeddings)
-        # tag_embeddings = self.tgt_norm(tag_embeddings)
-
         mask_seq = (sequence>0).float()
         mask_tag = (tag>0).float().view(tag.shape[0],-1)
-        #
+        return item_embeddings, tag_embeddings, mask_seq, mask_tag
+
+    def forward(self, sequence, tag, train_flag=True):
+        item_embeddings, tag_embeddings, mask_seq, mask_tag = self.prepare_inputs(sequence, tag)
 
         # out_seq = item_embeddings
         # last_item = item_embeddings[:, -1, :]
@@ -172,8 +165,13 @@ class Att_Diffuse_model(nn.Module):
         # item_rep = self.model_main(item_embeddings, last_item, mask_seq)
         # seq_rep = item_rep[:, -1, :]
         # scores = torch.matmul(seq_rep, self.item_embeddings.weight.t())
-        # scores = None
+            # scores = None
         return out_seq, last_item, dif_loss
+
+    def denoise_sample_only(self, sequence, tag):
+        item_embeddings, tag_embeddings, mask_seq, mask_tag = self.prepare_inputs(sequence, tag)
+        out_seq = self.diffu.denoise_sample(item_embeddings, tag_embeddings, mask_seq, mask_tag)
+        return out_seq, out_seq[:, -1, :]
 
 
 def create_model_diffu(args):

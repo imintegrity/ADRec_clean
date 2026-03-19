@@ -20,6 +20,14 @@ def main():
     fix_random_seed_as(args.random_seed)
     args = item_num_create(args)
     model = choose_model(args)
+    resolved_recipe = {
+        'pretrained': args.pretrained,
+        'freeze_emb': args.freeze_emb,
+        'embedding_warmup_epochs': getattr(args, 'embedding_warmup_epochs', None),
+        'dif_decoder': args.dif_decoder,
+    }
+    logger.info(f"Resolved recipe: {resolved_recipe}")
+    print(f"Resolved recipe: {resolved_recipe}")
     tra_data_loader, val_data_loader, test_data_loader = load_data(args)
 
     # cold_hot_long_short(data_raw, args.dataset)
