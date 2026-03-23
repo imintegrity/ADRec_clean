@@ -23,7 +23,13 @@ class DenoisedModel(nn.Module):
         elif args.dif_decoder == 'mamba':
             self.decoder = MambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2))
         elif args.dif_decoder == 'mamba_tcond':
-            self.decoder = TimestepConditionedMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2))
+            self.decoder = TimestepConditionedMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), placement='full')
+        elif args.dif_decoder == 'mamba_tcond_ssm':
+            self.decoder = TimestepConditionedMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), placement='ssm')
+        elif args.dif_decoder == 'mamba_tcond_ffn':
+            self.decoder = TimestepConditionedMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), placement='ffn')
+        elif args.dif_decoder == 'mamba_tcond_input':
+            self.decoder = TimestepConditionedMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), placement='input')
         else:
             self.decoder = TransformerEncoder(args,num_blocks=2,norm_first=False,hidden_size=self.hidden_size)
 
@@ -74,7 +80,7 @@ class DenoisedModel(nn.Module):
 
         if self.decoder_type == 'mlp':
             rep_diffu = self.decoder(rep_diffu)
-        elif self.decoder_type == 'mamba_tcond':
+        elif self.decoder_type in {'mamba_tcond', 'mamba_tcond_ssm', 'mamba_tcond_ffn', 'mamba_tcond_input'}:
             rep_diffu = self.decoder(rep_diffu, mask_seq, time_emb)
         else:
             rep_diffu = self.decoder(rep_diffu, mask_seq)

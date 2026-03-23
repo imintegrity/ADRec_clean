@@ -31,7 +31,11 @@ patience: 4  # The number of epoch to wait before early stop
 
 diversity_measure: false  # Measure the diversity of recommendation results
 epoch_time_avg: false  # Calculate the average time of one epoch training
-dif_decoder: att  # Choose denoised decoder: 'att', 'mlp', 'mamba' or 'mamba_tcond'
+# Choose denoised decoder:
+# 'att', 'mlp', 'mamba',
+# 'mamba_tcond', 'mamba_tcond_ssm',
+# 'mamba_tcond_ffn', 'mamba_tcond_input'
+dif_decoder: att
 mamba_d_state: 16
 mamba_d_conv: 4
 mamba_expand: 2

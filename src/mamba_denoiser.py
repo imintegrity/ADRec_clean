@@ -18,21 +18,30 @@ def modulate(hidden, shift, scale):
     return hidden * (1 + scale) + shift
 
 
-def masked_gate_stats(gate, valid_mask):
+def masked_tensor_stats(tensor, valid_mask):
     if valid_mask is None:
-        flat_gate = gate.reshape(-1)
+        flat_tensor = tensor.reshape(-1)
     else:
         valid_positions = valid_mask > 0
         if valid_positions.any():
-            flat_gate = gate[valid_positions]
+            flat_tensor = tensor[valid_positions]
         else:
-            flat_gate = gate.new_zeros(1)
+            flat_tensor = tensor.new_zeros(1)
 
     return {
-        "mean": flat_gate.mean().detach(),
-        "std": flat_gate.std(unbiased=False).detach(),
-        "min": flat_gate.min().detach(),
-        "max": flat_gate.max().detach(),
+        "mean": flat_tensor.mean().detach(),
+        "std": flat_tensor.std(unbiased=False).detach(),
+        "min": flat_tensor.min().detach(),
+        "max": flat_tensor.max().detach(),
+    }
+
+
+def prefixed_stats(prefix, stats):
+    return {
+        f"{prefix}_mean": stats["mean"],
+        f"{prefix}_std": stats["std"],
+        f"{prefix}_min": stats["min"],
+        f"{prefix}_max": stats["max"],
     }
 
 
@@ -62,8 +71,7 @@ class MambaBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, hidden, valid_mask=None):
-        if valid_mask is not None:
-            hidden = apply_mask(hidden, valid_mask)
+        hidden = apply_mask(hidden, valid_mask)
 
         residual = hidden
         hidden = self.norm1(hidden)
@@ -75,9 +83,7 @@ class MambaBlock(nn.Module):
         hidden = self.ffn(hidden)
         hidden = residual + self.dropout(hidden)
 
-        if valid_mask is not None:
-            hidden = apply_mask(hidden, valid_mask)
-
+        hidden = apply_mask(hidden, valid_mask)
         return hidden
 
 
@@ -104,11 +110,11 @@ class MambaDenoiser(nn.Module):
 
 
 class TimestepConditionedMambaBlock(nn.Module):
-    def __init__(self, hidden_size, dropout, alpha_max=0.1, d_state=16, d_conv=4, expand=2):
+    def __init__(self, hidden_size, dropout, alpha_max=0.1, placement="full", d_state=16, d_conv=4, expand=2):
         super().__init__()
         if Mamba is None:
             raise ImportError(
-                "dif_decoder='mamba_tcond' requires the optional package 'mamba_ssm'."
+                "timestep-conditioned Mamba decoders require the optional package 'mamba_ssm'."
             )
 
         self.norm1 = nn.LayerNorm(hidden_size)
@@ -133,57 +139,74 @@ class TimestepConditionedMambaBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size * 3),
         )
+        self.time_to_input = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size * 2),
+        )
         self.alpha_max = alpha_max
+        self.placement = placement
         self.dropout = nn.Dropout(dropout)
 
         nn.init.zeros_(self.time_to_ssm[-1].weight)
         nn.init.zeros_(self.time_to_ssm[-1].bias)
         nn.init.zeros_(self.time_to_ffn[-1].weight)
         nn.init.zeros_(self.time_to_ffn[-1].bias)
+        nn.init.zeros_(self.time_to_input[-1].weight)
+        nn.init.zeros_(self.time_to_input[-1].bias)
 
     def forward(self, hidden, time_emb, valid_mask=None):
         hidden = apply_mask(hidden, valid_mask)
+        stats = {}
+
+        if self.placement == "input":
+            input_shift, input_scale = self.time_to_input(time_emb).chunk(2, dim=-1)
+            hidden = modulate(hidden, input_shift, input_scale)
+            hidden = apply_mask(hidden, valid_mask)
+            stats.update(prefixed_stats("tcond_input_shift", masked_tensor_stats(input_shift, valid_mask)))
+            stats.update(prefixed_stats("tcond_input_scale", masked_tensor_stats(input_scale, valid_mask)))
 
         residual = hidden
-        ssm_shift, ssm_scale, ssm_gate_raw = self.time_to_ssm(time_emb).chunk(3, dim=-1)
-        ssm_gate = 1.0 + self.alpha_max * torch.tanh(ssm_gate_raw)
-        hidden = modulate(self.norm1(hidden), ssm_shift, ssm_scale)
-        hidden = self.mamba(hidden)
-        hidden = residual + ssm_gate * self.dropout(hidden)
+        ssm_hidden = self.norm1(hidden)
+        if self.placement in ("full", "ssm"):
+            ssm_shift, ssm_scale, ssm_gate_raw = self.time_to_ssm(time_emb).chunk(3, dim=-1)
+            ssm_gate = 1.0 + self.alpha_max * torch.tanh(ssm_gate_raw)
+            ssm_hidden = modulate(ssm_hidden, ssm_shift, ssm_scale)
+            ssm_hidden = self.mamba(ssm_hidden)
+            hidden = residual + ssm_gate * self.dropout(ssm_hidden)
+            stats.update(prefixed_stats("tcond_ssm_gate", masked_tensor_stats(ssm_gate, valid_mask)))
+        else:
+            ssm_hidden = self.mamba(ssm_hidden)
+            hidden = residual + self.dropout(ssm_hidden)
 
         residual = hidden
-        ffn_shift, ffn_scale, ffn_gate_raw = self.time_to_ffn(time_emb).chunk(3, dim=-1)
-        ffn_gate = 1.0 + self.alpha_max * torch.tanh(ffn_gate_raw)
-        hidden = modulate(self.norm2(hidden), ffn_shift, ffn_scale)
-        hidden = self.ffn(hidden)
-        hidden = residual + ffn_gate * self.dropout(hidden)
+        ffn_hidden = self.norm2(hidden)
+        if self.placement in ("full", "ffn"):
+            ffn_shift, ffn_scale, ffn_gate_raw = self.time_to_ffn(time_emb).chunk(3, dim=-1)
+            ffn_gate = 1.0 + self.alpha_max * torch.tanh(ffn_gate_raw)
+            ffn_hidden = modulate(ffn_hidden, ffn_shift, ffn_scale)
+            ffn_hidden = self.ffn(ffn_hidden)
+            hidden = residual + ffn_gate * self.dropout(ffn_hidden)
+            stats.update(prefixed_stats("tcond_ffn_gate", masked_tensor_stats(ffn_gate, valid_mask)))
+        else:
+            ffn_hidden = self.ffn(ffn_hidden)
+            hidden = residual + self.dropout(ffn_hidden)
 
         hidden = apply_mask(hidden, valid_mask)
-        ssm_stats = masked_gate_stats(ssm_gate, valid_mask)
-        ffn_stats = masked_gate_stats(ffn_gate, valid_mask)
-        stats = {
-            "tcond_ssm_gate_mean": ssm_stats["mean"],
-            "tcond_ffn_gate_mean": ffn_stats["mean"],
-            "tcond_ssm_gate_std": ssm_stats["std"],
-            "tcond_ffn_gate_std": ffn_stats["std"],
-            "tcond_ssm_gate_min": ssm_stats["min"],
-            "tcond_ffn_gate_min": ffn_stats["min"],
-            "tcond_ssm_gate_max": ssm_stats["max"],
-            "tcond_ffn_gate_max": ffn_stats["max"],
-        }
         return hidden, stats
 
 
 class TimestepConditionedMambaDenoiser(nn.Module):
-    def __init__(self, args, num_blocks):
+    def __init__(self, args, num_blocks, placement="full"):
         super().__init__()
         self.latest_stats = {}
+        self.placement = placement
         self.layers = nn.ModuleList(
             [
                 TimestepConditionedMambaBlock(
                     hidden_size=args.hidden_size,
                     dropout=args.dropout,
                     alpha_max=args.tcond_gate_alpha_max,
+                    placement=placement,
                     d_state=args.mamba_d_state,
                     d_conv=args.mamba_d_conv,
                     expand=args.mamba_expand,
@@ -191,26 +214,30 @@ class TimestepConditionedMambaDenoiser(nn.Module):
                 for _ in range(num_blocks)
             ]
         )
+        self.active_branches = {
+            "full": "ssm,ffn",
+            "ssm": "ssm_only",
+            "ffn": "ffn_only",
+            "input": "input_only",
+        }[placement]
 
     def forward(self, hidden, valid_mask, time_emb):
-        stats_buffer = {
-            "tcond_ssm_gate_mean": [],
-            "tcond_ffn_gate_mean": [],
-            "tcond_ssm_gate_std": [],
-            "tcond_ffn_gate_std": [],
-            "tcond_ssm_gate_min": [],
-            "tcond_ffn_gate_min": [],
-            "tcond_ssm_gate_max": [],
-            "tcond_ffn_gate_max": [],
-        }
+        stats_buffer = {}
         for layer in self.layers:
             hidden, layer_stats = layer(hidden, time_emb, valid_mask)
             for key, value in layer_stats.items():
-                stats_buffer[key].append(value)
+                stats_buffer.setdefault(key, []).append(value)
+
         self.latest_stats = {
-            key: float(torch.stack(values).mean().item())
-            for key, values in stats_buffer.items()
+            "tcond_placement": self.placement,
+            "tcond_active_branches": self.active_branches,
         }
+        self.latest_stats.update(
+            {
+                key: float(torch.stack(values).mean().item())
+                for key, values in stats_buffer.items()
+            }
+        )
         return hidden
 
     def get_latest_stats(self):
