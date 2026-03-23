@@ -9,7 +9,6 @@ dif_blocks: 2  # Number of denoiser blocks
 dropout: 0.1  # Dropout of representation
 emb_dropout: 0.3  # Dropout of item embedding
 hidden_act: gelu  # Activation function: gelu or relu
-dif_blocks: 2  # Number of denoised decoder blocks
 epochs: 500 # Number of epochs for training
 decay_step: 100  # Decay step for StepLR
 gamma: 0.1  # Gamma for StepLR
@@ -32,10 +31,11 @@ patience: 4  # The number of epoch to wait before early stop
 
 diversity_measure: false  # Measure the diversity of recommendation results
 epoch_time_avg: false  # Calculate the average time of one epoch training
-dif_decoder: att  # Choose denoised decoder: 'att', 'mlp' or 'mamba'
+dif_decoder: att  # Choose denoised decoder: 'att', 'mlp', 'mamba' or 'mamba_tcond'
 mamba_d_state: 16
 mamba_d_conv: 4
 mamba_expand: 2
+tcond_gate_alpha_max: 0.1
 split_onebyone: false  # Split sequence one by one
 noise_schedule: trunc_lin
 beta_a: 0.3 #beta_schedule
@@ -45,8 +45,8 @@ dif_objective: pred_x0  # Choose diffusion loss objective: 'pred_noise', 'pred_x
 parallel_ag: true  # Train in a per token auto-aggressive manner
 model: adrec  # Model name:'diffurec','adrec'
 independent: true # Independent diffusion, can only work in adrec
-pretrained: false
-freeze_emb: false
+pretrained: true  # ADRec baseline effective recipe; choose_model will force this when disable_adrec_pretrained=false
+freeze_emb: true  # ADRec baseline effective recipe; choose_model will force this when disable_adrec_pretrained=false
 disable_adrec_pretrained: false
 embedding_warmup_epochs: 5
 cfg_scale: 1

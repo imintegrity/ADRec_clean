@@ -96,23 +96,31 @@ def build_efficiency_report(model_joint, args):
     decoder = getattr(diffu_net, 'decoder', None)
     total_params, trainable_params = count_parameters(model_joint)
     if diffu_net is None:
-        diffusion_net_params, diffusion_net_trainable_params = 0, 0
+        denoiser_wrapper_params, denoiser_wrapper_trainable_params = 0, 0
     else:
-        diffusion_net_params, diffusion_net_trainable_params = count_parameters(diffu_net)
+        denoiser_wrapper_params, denoiser_wrapper_trainable_params = count_parameters(diffu_net)
     if decoder is None:
         decoder_params, decoder_trainable_params = 0, 0
     else:
         decoder_params, decoder_trainable_params = count_parameters(decoder)
     return {
         'dif_decoder': args.dif_decoder,
+        'tcond_gate_alpha_max': getattr(args, 'tcond_gate_alpha_max', None),
         'total_params': total_params,
         'trainable_params': trainable_params,
-        'diffusion_net_params': diffusion_net_params,
-        'diffusion_net_trainable_params': diffusion_net_trainable_params,
+        'denoiser_wrapper_params': denoiser_wrapper_params,
+        'denoiser_wrapper_trainable_params': denoiser_wrapper_trainable_params,
         'decoder_params': decoder_params,
         'decoder_trainable_params': decoder_trainable_params,
         'epoch_efficiency': [],
     }
+
+
+def get_tcond_stats(model_joint):
+    decoder = getattr(getattr(getattr(model_joint, 'diffu', None), 'net', None), 'decoder', None)
+    if decoder is None or not hasattr(decoder, 'get_latest_stats'):
+        return {}
+    return decoder.get_latest_stats()
 
 
 def save_efficiency_report(report, args, train_time):
@@ -150,6 +158,7 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             model_joint.item_embedding.weight.requires_grad = True
         ce_losses = []
         dif_losses = []
+        epoch_tcond_stats = {}
         flag_update = 0
         epoch_samples = 0
         if is_cuda_device(device):
@@ -177,6 +186,9 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             optimizer.pc_backward(losses)
             ce_losses.append(ce_loss.item())
             dif_losses.append(dif_loss.item())
+            current_tcond_stats = get_tcond_stats(model_joint)
+            for key, value in current_tcond_stats.items():
+                epoch_tcond_stats.setdefault(key, []).append(value)
             optimizer.step()
             pbr_train.set_postfix_str(f'loss={ce_losses[-1]:.3f}')
             # if index_temp % int(len(tra_data_loader) / 5 + 1) == 0:
@@ -199,15 +211,20 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             samples_per_sec,
             peak_memory_mb,
         )
-        efficiency_report['epoch_efficiency'].append(
-            {
-                'epoch': epoch_temp,
-                'epoch_time_sec': epoch_time,
-                'avg_step_time_sec': avg_step_time,
-                'samples_per_sec': samples_per_sec,
-                'peak_gpu_mem_mb': peak_memory_mb,
+        epoch_efficiency_entry = {
+            'epoch': epoch_temp,
+            'epoch_time_sec': epoch_time,
+            'avg_step_time_sec': avg_step_time,
+            'samples_per_sec': samples_per_sec,
+            'peak_gpu_mem_mb': peak_memory_mb,
+        }
+        if args.dif_decoder == 'mamba_tcond' and epoch_tcond_stats:
+            epoch_tcond_summary = {
+                key: float(np.mean(values)) for key, values in epoch_tcond_stats.items()
             }
-        )
+            logger.info(f"epoch {epoch_temp} tcond gate stats: {epoch_tcond_summary}")
+            epoch_efficiency_entry.update(epoch_tcond_summary)
+        efficiency_report['epoch_efficiency'].append(epoch_efficiency_entry)
         lr_scheduler.step()
         # if epoch_temp == 10:
         #     args.eval_interval=3
