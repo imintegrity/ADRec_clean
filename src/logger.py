@@ -110,7 +110,7 @@ def cmdline_args():
     parser.add_argument('--long_head', type=str2bool, help='Long and short sequence, head and long-tail items')
     parser.add_argument('--diversity_measure', type=str2bool, help='Measure the diversity of recommendation results')
     parser.add_argument('--epoch_time_avg', type=str2bool, help='Calculate the average time of one epoch training')
-    parser.add_argument('--dif_decoder', type=str, choices=['att', 'mlp', 'mamba', 'mamba_tcond', 'mamba_tcond_ssm', 'mamba_tcond_ffn', 'mamba_tcond_input'], help='Choose denoised decoder')
+    parser.add_argument('--dif_decoder', type=str, choices=['att', 'mlp', 'mamba', 'mamba_tcond', 'mamba_tcond_ssm', 'mamba_tcond_ffn', 'mamba_tcond_input', 'spc_mamba_nogate', 'spc_mamba'], help='Choose denoised decoder')
     parser.add_argument('--mamba_d_state', type=int, help='Mamba state size')
     parser.add_argument('--mamba_d_conv', type=int, help='Mamba local conv width')
     parser.add_argument('--mamba_expand', type=int, help='Mamba expand ratio')

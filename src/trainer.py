@@ -106,6 +106,8 @@ def build_efficiency_report(model_joint, args):
     return {
         'dif_decoder': args.dif_decoder,
         'tcond_gate_alpha_max': getattr(args, 'tcond_gate_alpha_max', None),
+        'decoder_mode': getattr(decoder, 'decoder_mode', None),
+        'decoder_active_components': getattr(decoder, 'active_components', None),
         'tcond_placement': getattr(getattr(diffu_net, 'decoder', None), 'placement', None),
         'tcond_active_branches': getattr(getattr(diffu_net, 'decoder', None), 'active_branches', None),
         'total_params': total_params,
@@ -152,6 +154,7 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
     best_model = None
     efficiency_report = build_efficiency_report(model_joint, args)
     logger.info(f"Model efficiency summary: {efficiency_report}")
+    train_wall_clock_start = time.perf_counter()
     for epoch_temp in range(epochs):
         model_joint.train()
         if (
@@ -225,7 +228,7 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             'samples_per_sec': samples_per_sec,
             'peak_gpu_mem_mb': peak_memory_mb,
         }
-        if args.dif_decoder in {'mamba_tcond', 'mamba_tcond_ssm', 'mamba_tcond_ffn', 'mamba_tcond_input'} and epoch_tcond_stats:
+        if epoch_tcond_stats:
             epoch_tcond_summary = {
                 key: float(np.mean(values)) for key, values in epoch_tcond_stats.items()
             }
@@ -244,18 +247,25 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             # print('start predicting: ', datetime.datetime.now())
             # logger.info('start predicting: {}'.format(datetime.datetime.now()))
             metrics_dict = {'HR@5': [], 'NDCG@5': [], 'HR@10': [], 'NDCG@10': [], 'HR@20': [], 'NDCG@20': []}
+            val_inference_latencies = []
             model_joint.eval()
             with torch.no_grad():
                 for val_batch in tqdm(val_data_loader,leave=False,desc='Denoising..., Epoch: {}'.format(epoch_temp)):
                     val_batch = [x.to(device) for x in val_batch]
+                    sync_cuda_if_needed(device)
+                    val_batch_start = time.perf_counter()
                     out_seq, last_item, *_= model_joint(val_batch[0], val_batch[1], train_flag=False)
-
+                    sync_cuda_if_needed(device)
+                    val_inference_latencies.append(time.perf_counter() - val_batch_start)
                     scores_rec_diffu = model_joint.calculate_score(last_item)    ### inner_production
                     # scores_rec_diffu = model_joint.routing_rep_pre(rep_diffu)   ### routing_rep_pre
                     # print(scores_rec_diffu.shape,val_batch[1][:,-1].shape)
                     metrics = hrs_and_ndcgs_k(scores_rec_diffu, val_batch[1][:,-1:], metric_ks)
                     for k, v in metrics.items():
                         metrics_dict[k].append(v)
+            if val_inference_latencies:
+                efficiency_report['val_inference_avg_batch_latency_sec'] = float(np.mean(val_inference_latencies))
+                efficiency_report['val_inference_p95_batch_latency_sec'] = float(np.percentile(val_inference_latencies, 95))
 
             for key_temp, values_temp in metrics_dict.items():
                 values_mean = round(np.mean(values_temp) * 100, 4)
@@ -351,6 +361,9 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
     if scoring_latencies:
         efficiency_report['test_scoring_avg_batch_latency_sec'] = float(np.mean(scoring_latencies))
         efficiency_report['test_scoring_p95_batch_latency_sec'] = float(np.percentile(scoring_latencies, 95))
+    efficiency_report['train_wall_clock_sec'] = float(time.perf_counter() - train_wall_clock_start)
+    if efficiency_report['epoch_efficiency']:
+        efficiency_report['avg_epoch_time_sec'] = float(np.mean([entry['epoch_time_sec'] for entry in efficiency_report['epoch_efficiency']]))
     report_path = save_efficiency_report(efficiency_report, args, train_time)
     logger.info(f"Efficiency report saved to {report_path}")
 

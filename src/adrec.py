@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from common import SiLU, TransformerEncoder
 from utils import _extract_into_tensor,exponential_mapping
 from step_sample import *
-from mamba_denoiser import MambaDenoiser, TimestepConditionedMambaDenoiser
+from mamba_denoiser import MambaDenoiser, TimestepConditionedMambaDenoiser, StatePreservingConditionalMambaDenoiser
 
 class DenoisedModel(nn.Module):
     def __init__(self, args):
@@ -30,6 +30,10 @@ class DenoisedModel(nn.Module):
             self.decoder = TimestepConditionedMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), placement='ffn')
         elif args.dif_decoder == 'mamba_tcond_input':
             self.decoder = TimestepConditionedMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), placement='input')
+        elif args.dif_decoder == 'spc_mamba_nogate':
+            self.decoder = StatePreservingConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='nogate')
+        elif args.dif_decoder == 'spc_mamba':
+            self.decoder = StatePreservingConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='gated')
         else:
             self.decoder = TransformerEncoder(args,num_blocks=2,norm_first=False,hidden_size=self.hidden_size)
 
@@ -77,9 +81,12 @@ class DenoisedModel(nn.Module):
         lambda_uncertainty = self.lambda_uncertainty  ### fixed
 
         rep_diffu = rep_item + lambda_uncertainty * (x_t + time_emb)
+        state_input = x_t + time_emb
 
         if self.decoder_type == 'mlp':
             rep_diffu = self.decoder(rep_diffu)
+        elif self.decoder_type in {'spc_mamba_nogate', 'spc_mamba'}:
+            rep_diffu = self.decoder(state_input, rep_item, mask_seq, time_emb)
         elif self.decoder_type in {'mamba_tcond', 'mamba_tcond_ssm', 'mamba_tcond_ffn', 'mamba_tcond_input'}:
             rep_diffu = self.decoder(rep_diffu, mask_seq, time_emb)
         else:

@@ -109,6 +109,122 @@ class MambaDenoiser(nn.Module):
         return hidden
 
 
+class StatePreservingConditionalMambaBlock(nn.Module):
+    def __init__(self, hidden_size, dropout, alpha_max=0.1, mode="gated", d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        if Mamba is None:
+            raise ImportError(
+                "state-preserving conditional Mamba decoders require the optional package 'mamba_ssm'."
+            )
+
+        self.mode = mode
+        self.alpha_max = alpha_max
+        self.norm_state = nn.LayerNorm(hidden_size)
+        self.mamba = Mamba(
+            d_model=hidden_size,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        self.norm_refine = nn.LayerNorm(hidden_size)
+        self.cond_to_refine = nn.Linear(hidden_size, hidden_size)
+        self.time_to_refine = nn.Linear(hidden_size, hidden_size)
+        self.refine_ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+        self.gate_proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+        nn.init.normal_(self.cond_to_refine.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.cond_to_refine.bias)
+        nn.init.normal_(self.time_to_refine.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.time_to_refine.bias)
+        nn.init.zeros_(self.gate_proj[-1].weight)
+        nn.init.constant_(self.gate_proj[-1].bias, -4.0)
+
+    def forward(self, hidden, cond_stream, time_emb, valid_mask=None):
+        hidden = apply_mask(hidden, valid_mask)
+        stats = {}
+
+        residual = hidden
+        state_hidden = self.norm_state(hidden)
+        state_hidden = self.mamba(state_hidden)
+        hidden = residual + self.dropout(state_hidden)
+
+        residual = hidden
+        cond_hidden = self.cond_to_refine(cond_stream)
+        time_hidden = self.time_to_refine(time_emb)
+        refine_hidden = self.norm_refine(hidden) + cond_hidden + time_hidden
+        delta = self.refine_ffn(refine_hidden)
+        stats.update(prefixed_stats("spc_delta", masked_tensor_stats(delta, valid_mask)))
+
+        if self.mode == "nogate":
+            hidden = residual + self.dropout(delta)
+        else:
+            gate = self.alpha_max * torch.sigmoid(self.gate_proj(refine_hidden))
+            hidden = residual + gate * self.dropout(delta)
+            stats.update(prefixed_stats("spc_gate", masked_tensor_stats(gate, valid_mask)))
+
+        hidden = apply_mask(hidden, valid_mask)
+        return hidden, stats
+
+
+class StatePreservingConditionalMambaDenoiser(nn.Module):
+    def __init__(self, args, num_blocks, mode="gated"):
+        super().__init__()
+        self.latest_stats = {}
+        self.mode = mode
+        self.decoder_mode = mode
+        self.active_components = "plain_mamba_state+conditional_refinement"
+        self.state_proj = nn.Linear(args.hidden_size, args.hidden_size)
+        self.cond_proj = nn.Linear(args.hidden_size, args.hidden_size)
+        self.layers = nn.ModuleList(
+            [
+                StatePreservingConditionalMambaBlock(
+                    hidden_size=args.hidden_size,
+                    dropout=args.dropout,
+                    alpha_max=args.tcond_gate_alpha_max,
+                    mode=mode,
+                    d_state=args.mamba_d_state,
+                    d_conv=args.mamba_d_conv,
+                    expand=args.mamba_expand,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+
+    def forward(self, state_input, cond_input, valid_mask, time_emb):
+        hidden = apply_mask(self.state_proj(state_input), valid_mask)
+        cond_stream = apply_mask(self.cond_proj(cond_input), valid_mask)
+        stats_buffer = {}
+
+        for layer in self.layers:
+            hidden, layer_stats = layer(hidden, cond_stream, time_emb, valid_mask)
+            for key, value in layer_stats.items():
+                stats_buffer.setdefault(key, []).append(value)
+
+        self.latest_stats = {
+            "spc_mode": self.mode,
+            "spc_active_components": self.active_components,
+        }
+        self.latest_stats.update(
+            {
+                key: float(torch.stack(values).mean().item())
+                for key, values in stats_buffer.items()
+            }
+        )
+        return hidden
+
+    def get_latest_stats(self):
+        return dict(self.latest_stats)
+
+
 class TimestepConditionedMambaBlock(nn.Module):
     def __init__(self, hidden_size, dropout, alpha_max=0.1, placement="full", d_state=16, d_conv=4, expand=2):
         super().__init__()
