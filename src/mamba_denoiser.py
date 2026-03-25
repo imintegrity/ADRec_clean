@@ -109,6 +109,140 @@ class MambaDenoiser(nn.Module):
         return hidden
 
 
+class AdaLNConditionalMambaBlock(nn.Module):
+    def __init__(self, hidden_size, dropout, alpha_max=0.1, use_input_coupling=False, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        if Mamba is None:
+            raise ImportError(
+                "AdaLN-conditioned Mamba decoders require the optional package 'mamba_ssm'."
+            )
+
+        self.use_input_coupling = use_input_coupling
+        self.alpha_max = alpha_max
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.mamba = Mamba(
+            d_model=hidden_size,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        self.norm2 = nn.LayerNorm(hidden_size)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+        self.modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size * 6),
+        )
+        self.input_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size * 2),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+        nn.init.zeros_(self.modulation[-1].weight)
+        nn.init.zeros_(self.modulation[-1].bias)
+        nn.init.constant_(self.modulation[-1].bias[2 * hidden_size:3 * hidden_size], -4.0)
+        nn.init.constant_(self.modulation[-1].bias[5 * hidden_size:6 * hidden_size], -4.0)
+        nn.init.zeros_(self.input_modulation[-1].weight)
+        nn.init.zeros_(self.input_modulation[-1].bias)
+
+    def forward(self, hidden, cond_ctx, valid_mask=None):
+        hidden = apply_mask(hidden, valid_mask)
+        stats = {}
+
+        if self.use_input_coupling:
+            input_shift, input_scale = self.input_modulation(cond_ctx).chunk(2, dim=-1)
+            hidden = modulate(hidden, input_shift, input_scale)
+            hidden = apply_mask(hidden, valid_mask)
+            stats.update(prefixed_stats("adaln_input_shift", masked_tensor_stats(input_shift, valid_mask)))
+            stats.update(prefixed_stats("adaln_input_scale", masked_tensor_stats(input_scale, valid_mask)))
+
+        shift_m, scale_m, gate_m_raw, shift_f, scale_f, gate_f_raw = self.modulation(cond_ctx).chunk(6, dim=-1)
+        gate_m = self.alpha_max * torch.sigmoid(gate_m_raw)
+        gate_f = self.alpha_max * torch.sigmoid(gate_f_raw)
+
+        residual = hidden
+        hidden_m = modulate(self.norm1(hidden), shift_m, scale_m)
+        hidden_m = self.mamba(hidden_m)
+        hidden = residual + gate_m * self.dropout(hidden_m)
+
+        residual = hidden
+        hidden_f = modulate(self.norm2(hidden), shift_f, scale_f)
+        hidden_f = self.ffn(hidden_f)
+        hidden = residual + gate_f * self.dropout(hidden_f)
+
+        hidden = apply_mask(hidden, valid_mask)
+        stats.update(prefixed_stats("adaln_gate_m", masked_tensor_stats(gate_m, valid_mask)))
+        stats.update(prefixed_stats("adaln_gate_f", masked_tensor_stats(gate_f, valid_mask)))
+        stats.update(prefixed_stats("adaln_scale_m", masked_tensor_stats(scale_m, valid_mask)))
+        stats.update(prefixed_stats("adaln_scale_f", masked_tensor_stats(scale_f, valid_mask)))
+        return hidden, stats
+
+
+class AdaLNConditionalMambaDenoiser(nn.Module):
+    def __init__(self, args, num_blocks, mode="adaln_only"):
+        super().__init__()
+        self.latest_stats = {}
+        self.mode = mode
+        self.decoder_mode = mode
+        self.active_components = "mamba_state+adaln_modulation"
+        self.use_input_coupling = mode == "tcond_input_adaln"
+        self.cond_proj = nn.Linear(args.hidden_size, args.hidden_size)
+        self.time_proj = nn.Linear(args.hidden_size, args.hidden_size)
+        self.input_proj = nn.Linear(args.hidden_size, args.hidden_size)
+        self.layers = nn.ModuleList(
+            [
+                AdaLNConditionalMambaBlock(
+                    hidden_size=args.hidden_size,
+                    dropout=args.dropout,
+                    alpha_max=args.tcond_gate_alpha_max,
+                    use_input_coupling=self.use_input_coupling,
+                    d_state=args.mamba_d_state,
+                    d_conv=args.mamba_d_conv,
+                    expand=args.mamba_expand,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+
+        nn.init.normal_(self.cond_proj.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.cond_proj.bias)
+        nn.init.normal_(self.time_proj.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.time_proj.bias)
+
+    def forward(self, hidden_input, rep_item, valid_mask, time_emb):
+        hidden = apply_mask(self.input_proj(hidden_input), valid_mask)
+        cond_ctx = apply_mask(self.cond_proj(rep_item) + self.time_proj(time_emb), valid_mask)
+        per_key_values = {}
+        block_stats = {}
+
+        for index, layer in enumerate(self.layers):
+            hidden, layer_stats = layer(hidden, cond_ctx, valid_mask)
+            for key, value in layer_stats.items():
+                per_key_values.setdefault(key, []).append(value)
+                block_stats[f"block{index}_{key}"] = float(value.item())
+
+        self.latest_stats = {
+            "adaln_mode": self.mode,
+            "adaln_active_components": self.active_components,
+        }
+        self.latest_stats.update(block_stats)
+        self.latest_stats.update(
+            {
+                key: float(torch.stack(values).mean().item())
+                for key, values in per_key_values.items()
+            }
+        )
+        return hidden
+
+    def get_latest_stats(self):
+        return dict(self.latest_stats)
+
+
 class StatePreservingConditionalMambaBlock(nn.Module):
     def __init__(self, hidden_size, dropout, alpha_max=0.1, mode="gated", d_state=16, d_conv=4, expand=2):
         super().__init__()

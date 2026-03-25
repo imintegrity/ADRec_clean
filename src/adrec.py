@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from common import SiLU, TransformerEncoder
 from utils import _extract_into_tensor,exponential_mapping
 from step_sample import *
-from mamba_denoiser import MambaDenoiser, TimestepConditionedMambaDenoiser, StatePreservingConditionalMambaDenoiser
+from mamba_denoiser import MambaDenoiser, TimestepConditionedMambaDenoiser, StatePreservingConditionalMambaDenoiser, AdaLNConditionalMambaDenoiser
 
 class DenoisedModel(nn.Module):
     def __init__(self, args):
@@ -34,6 +34,10 @@ class DenoisedModel(nn.Module):
             self.decoder = StatePreservingConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='nogate')
         elif args.dif_decoder == 'spc_mamba':
             self.decoder = StatePreservingConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='gated')
+        elif args.dif_decoder == 'mamba_adaln_only':
+            self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='adaln_only')
+        elif args.dif_decoder == 'mamba_tcond_input_adaln':
+            self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln')
         else:
             self.decoder = TransformerEncoder(args,num_blocks=2,norm_first=False,hidden_size=self.hidden_size)
 
@@ -87,6 +91,10 @@ class DenoisedModel(nn.Module):
             rep_diffu = self.decoder(rep_diffu)
         elif self.decoder_type in {'spc_mamba_nogate', 'spc_mamba'}:
             rep_diffu = self.decoder(state_input, rep_item, mask_seq, time_emb)
+        elif self.decoder_type == 'mamba_adaln_only':
+            rep_diffu = self.decoder(state_input, rep_item, mask_seq, time_emb)
+        elif self.decoder_type == 'mamba_tcond_input_adaln':
+            rep_diffu = self.decoder(rep_diffu, rep_item, mask_seq, time_emb)
         elif self.decoder_type in {'mamba_tcond', 'mamba_tcond_ssm', 'mamba_tcond_ffn', 'mamba_tcond_input'}:
             rep_diffu = self.decoder(rep_diffu, mask_seq, time_emb)
         else:

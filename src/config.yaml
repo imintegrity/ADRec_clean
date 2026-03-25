@@ -35,7 +35,8 @@ epoch_time_avg: false  # Calculate the average time of one epoch training
 # 'att', 'mlp', 'mamba',
 # 'mamba_tcond', 'mamba_tcond_ssm',
 # 'mamba_tcond_ffn', 'mamba_tcond_input',
-# 'spc_mamba_nogate', 'spc_mamba'
+# 'spc_mamba_nogate', 'spc_mamba',
+# 'mamba_adaln_only', 'mamba_tcond_input_adaln'
 dif_decoder: att
 mamba_d_state: 16
 mamba_d_conv: 4
