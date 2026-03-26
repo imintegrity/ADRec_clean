@@ -46,6 +46,71 @@ def prefixed_stats(prefix, stats):
     }
 
 
+class StageChannelRouter(nn.Module):
+    def __init__(
+        self,
+        hidden_size,
+        num_stages=4,
+        shared_ratio=0.5,
+        extra_ratio_low=0.125,
+        extra_ratio_high=0.375,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_stages = num_stages
+        self.shared_ratio = shared_ratio
+        self.extra_ratio_low = extra_ratio_low
+        self.extra_ratio_high = extra_ratio_high
+        stage_masks = self._build_stage_masks()
+        self.register_buffer("stage_masks", stage_masks, persistent=False)
+        self.register_buffer("active_ratios", stage_masks.mean(dim=-1), persistent=False)
+
+    def _build_stage_masks(self):
+        masks = torch.zeros(self.num_stages, self.hidden_size)
+        shared_channels = min(max(int(round(self.hidden_size * self.shared_ratio)), 0), self.hidden_size)
+        masks[:, :shared_channels] = 1.0
+        routed_capacity = self.hidden_size - shared_channels
+
+        if routed_capacity <= 0:
+            return masks
+
+        for stage_index in range(self.num_stages):
+            stage_progress = stage_index / max(self.num_stages - 1, 1)
+            extra_ratio = self.extra_ratio_low + stage_progress * (self.extra_ratio_high - self.extra_ratio_low)
+            extra_channels = min(max(int(round(self.hidden_size * extra_ratio)), 0), routed_capacity)
+            if extra_channels == 0:
+                continue
+            max_start = routed_capacity - extra_channels
+            if self.num_stages == 1 or max_start <= 0:
+                routed_start = 0
+            else:
+                routed_start = int(round(stage_index * max_start / (self.num_stages - 1)))
+            routed_end = routed_start + extra_channels
+            masks[stage_index, shared_channels + routed_start:shared_channels + routed_end] = 1.0
+
+        return masks
+
+    def forward(self, residual_output, stage_ids):
+        if stage_ids is None:
+            return residual_output
+        batch_size, seq_len, hidden_size = residual_output.shape
+        if hidden_size != self.hidden_size:
+            raise ValueError("stage router hidden size mismatch")
+
+        if stage_ids.dim() == 1:
+            stage_ids = stage_ids.unsqueeze(-1)
+        if stage_ids.size(1) == 1 and seq_len != 1:
+            stage_ids = stage_ids.expand(-1, seq_len)
+
+        clamped_stage_ids = stage_ids.long().clamp(min=0, max=self.num_stages - 1)
+        routing_mask = self.stage_masks.index_select(0, clamped_stage_ids.reshape(-1))
+        routing_mask = routing_mask.view(batch_size, seq_len, hidden_size)
+        return residual_output * routing_mask
+
+    def active_ratio_for_stage(self, stage_index):
+        return float(self.active_ratios[stage_index].item())
+
+
 class LocalSelfAttention(nn.Module):
     def __init__(self, hidden_size, num_heads=2, window_size=5, attn_dim=None, causal=True):
         super().__init__()
@@ -185,6 +250,12 @@ class AdaLNConditionalMambaBlock(nn.Module):
         local_attn_heads=2,
         local_attn_dim=None,
         causal=True,
+        route_m=False,
+        route_f=False,
+        route_num_stages=4,
+        route_shared_ratio=0.5,
+        route_extra_ratio_low=0.125,
+        route_extra_ratio_high=0.375,
         d_state=16,
         d_conv=4,
         expand=2,
@@ -197,6 +268,8 @@ class AdaLNConditionalMambaBlock(nn.Module):
 
         self.use_input_coupling = use_input_coupling
         self.use_local_attention = use_local_attention
+        self.route_m_enabled = route_m
+        self.route_f_enabled = route_f
         self.alpha_max = alpha_max
         self.norm1 = nn.LayerNorm(hidden_size)
         self.mamba = Mamba(
@@ -205,6 +278,13 @@ class AdaLNConditionalMambaBlock(nn.Module):
             d_conv=d_conv,
             expand=expand,
         )
+        self.route_m = StageChannelRouter(
+            hidden_size=hidden_size,
+            num_stages=route_num_stages,
+            shared_ratio=route_shared_ratio,
+            extra_ratio_low=route_extra_ratio_low,
+            extra_ratio_high=route_extra_ratio_high,
+        ) if self.route_m_enabled else None
         self.norm_attn = nn.LayerNorm(hidden_size)
         if self.use_local_attention:
             self.local_attention = LocalSelfAttention(
@@ -223,6 +303,13 @@ class AdaLNConditionalMambaBlock(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size * 4, hidden_size),
         )
+        self.route_f = StageChannelRouter(
+            hidden_size=hidden_size,
+            num_stages=route_num_stages,
+            shared_ratio=route_shared_ratio,
+            extra_ratio_low=route_extra_ratio_low,
+            extra_ratio_high=route_extra_ratio_high,
+        ) if self.route_f_enabled else None
         modulation_chunks = 9 if self.use_local_attention else 6
         self.modulation = nn.Sequential(
             nn.SiLU(),
@@ -245,7 +332,7 @@ class AdaLNConditionalMambaBlock(nn.Module):
         nn.init.zeros_(self.input_modulation[-1].weight)
         nn.init.zeros_(self.input_modulation[-1].bias)
 
-    def forward(self, hidden, cond_ctx, valid_mask=None):
+    def forward(self, hidden, cond_ctx, valid_mask=None, stage_ids=None):
         hidden = apply_mask(hidden, valid_mask)
         stats = {}
 
@@ -268,6 +355,8 @@ class AdaLNConditionalMambaBlock(nn.Module):
         residual = hidden
         hidden_m = modulate(self.norm1(hidden), shift_m, scale_m)
         hidden_m = self.mamba(hidden_m)
+        if self.route_m is not None:
+            hidden_m = self.route_m(hidden_m, stage_ids)
         hidden = residual + gate_m * self.dropout(hidden_m)
 
         if self.use_local_attention:
@@ -279,6 +368,8 @@ class AdaLNConditionalMambaBlock(nn.Module):
         residual = hidden
         hidden_f = modulate(self.norm2(hidden), shift_f, scale_f)
         hidden_f = self.ffn(hidden_f)
+        if self.route_f is not None:
+            hidden_f = self.route_f(hidden_f, stage_ids)
         hidden = residual + gate_f * self.dropout(hidden_f)
 
         hidden = apply_mask(hidden, valid_mask)
@@ -302,22 +393,43 @@ class AdaLNConditionalMambaDenoiser(nn.Module):
             "tcond_input_adaln",
             "tcond_input_adaln_localattn_last",
             "tcond_input_adaln_localattn_all",
+            "tcond_input_adaln_stage_route_m",
+            "tcond_input_adaln_stage_route_f",
+            "tcond_input_adaln_stage_route_both",
         }
         self.local_attention_mode = {
             "adaln_only": "none",
             "tcond_input_adaln": "none",
             "tcond_input_adaln_localattn_last": "last",
             "tcond_input_adaln_localattn_all": "all",
+            "tcond_input_adaln_stage_route_m": "none",
+            "tcond_input_adaln_stage_route_f": "none",
+            "tcond_input_adaln_stage_route_both": "none",
+        }[mode]
+        self.stage_routing_mode = {
+            "adaln_only": "none",
+            "tcond_input_adaln": "none",
+            "tcond_input_adaln_localattn_last": "none",
+            "tcond_input_adaln_localattn_all": "none",
+            "tcond_input_adaln_stage_route_m": "m",
+            "tcond_input_adaln_stage_route_f": "f",
+            "tcond_input_adaln_stage_route_both": "both",
         }[mode]
         self.active_components = "mamba_state+adaln_modulation"
         if self.local_attention_mode != "none":
             self.active_components += f"+local_attention_{self.local_attention_mode}"
+        if self.stage_routing_mode != "none":
+            self.active_components += f"+stage_route_{self.stage_routing_mode}"
         self.cond_proj = nn.Linear(args.hidden_size, args.hidden_size)
         self.time_proj = nn.Linear(args.hidden_size, args.hidden_size)
         self.input_proj = nn.Linear(args.hidden_size, args.hidden_size)
         self.local_attn_window = getattr(args, "local_attn_window", 5)
         self.local_attn_heads = getattr(args, "local_attn_heads", 2)
         self.local_attn_dim = getattr(args, "local_attn_dim", 0) or None
+        self.route_num_stages = getattr(args, "route_num_stages", 4)
+        self.route_shared_ratio = getattr(args, "route_shared_ratio", 0.5)
+        self.route_extra_ratio_low = getattr(args, "route_extra_ratio_low", 0.125)
+        self.route_extra_ratio_high = getattr(args, "route_extra_ratio_high", 0.375)
         self.layers = nn.ModuleList()
         for layer_index in range(num_blocks):
             use_local_attention = self.local_attention_mode == "all" or (
@@ -334,6 +446,12 @@ class AdaLNConditionalMambaDenoiser(nn.Module):
                     local_attn_heads=self.local_attn_heads,
                     local_attn_dim=self.local_attn_dim,
                     causal=getattr(args, "is_causal", True),
+                    route_m=self.stage_routing_mode in {"m", "both"},
+                    route_f=self.stage_routing_mode in {"f", "both"},
+                    route_num_stages=self.route_num_stages,
+                    route_shared_ratio=self.route_shared_ratio,
+                    route_extra_ratio_low=self.route_extra_ratio_low,
+                    route_extra_ratio_high=self.route_extra_ratio_high,
                     d_state=args.mamba_d_state,
                     d_conv=args.mamba_d_conv,
                     expand=args.mamba_expand,
@@ -345,17 +463,41 @@ class AdaLNConditionalMambaDenoiser(nn.Module):
         nn.init.normal_(self.time_proj.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.time_proj.bias)
 
-    def forward(self, hidden_input, rep_item, valid_mask, time_emb):
+    def forward(self, hidden_input, rep_item, valid_mask, time_emb, stage_ids=None):
         hidden = apply_mask(self.input_proj(hidden_input), valid_mask)
         cond_ctx = apply_mask(self.cond_proj(rep_item) + self.time_proj(time_emb), valid_mask)
         per_key_values = {}
         block_stats = {}
 
+        expanded_stage_ids = None
+        if stage_ids is not None:
+            if stage_ids.dim() == 1:
+                stage_ids = stage_ids.unsqueeze(-1)
+            expanded_stage_ids = stage_ids
+            if expanded_stage_ids.size(1) == 1 and hidden.size(1) != 1:
+                expanded_stage_ids = expanded_stage_ids.expand(-1, hidden.size(1))
+
         for index, layer in enumerate(self.layers):
-            hidden, layer_stats = layer(hidden, cond_ctx, valid_mask)
+            hidden, layer_stats = layer(hidden, cond_ctx, valid_mask, stage_ids=expanded_stage_ids)
             for key, value in layer_stats.items():
                 per_key_values.setdefault(key, []).append(value)
                 block_stats[f"block{index}_{key}"] = float(value.item())
+            if layer.route_m is not None:
+                for stage_index in range(self.route_num_stages):
+                    block_stats[f"block{index}_route_m_active_ratio_stage{stage_index}"] = layer.route_m.active_ratio_for_stage(stage_index)
+                if expanded_stage_ids is not None:
+                    current_ratio_m = layer.route_m.active_ratios.index_select(
+                        0, expanded_stage_ids.reshape(-1).long().clamp(min=0, max=self.route_num_stages - 1)
+                    )
+                    block_stats[f"block{index}_route_m_active_ratio_current_mean"] = float(current_ratio_m.float().mean().item())
+            if layer.route_f is not None:
+                for stage_index in range(self.route_num_stages):
+                    block_stats[f"block{index}_route_f_active_ratio_stage{stage_index}"] = layer.route_f.active_ratio_for_stage(stage_index)
+                if expanded_stage_ids is not None:
+                    current_ratio_f = layer.route_f.active_ratios.index_select(
+                        0, expanded_stage_ids.reshape(-1).long().clamp(min=0, max=self.route_num_stages - 1)
+                    )
+                    block_stats[f"block{index}_route_f_active_ratio_current_mean"] = float(current_ratio_f.float().mean().item())
 
         self.latest_stats = {
             "adaln_mode": self.mode,
@@ -364,7 +506,24 @@ class AdaLNConditionalMambaDenoiser(nn.Module):
             "adaln_local_attention_window": self.local_attn_window,
             "adaln_local_attention_heads": self.local_attn_heads,
             "adaln_local_attention_dim": self.input_proj.out_features if self.local_attn_dim is None else self.local_attn_dim,
+            "route_num_stages": self.route_num_stages,
+            "route_shared_ratio": self.route_shared_ratio,
+            "route_extra_ratio_low": self.route_extra_ratio_low,
+            "route_extra_ratio_high": self.route_extra_ratio_high,
+            "route_stage_routing_mode": self.stage_routing_mode,
         }
+        if expanded_stage_ids is not None:
+            stage_tensor = expanded_stage_ids.float()
+            self.latest_stats.update(prefixed_stats("current_stage_id", masked_tensor_stats(stage_tensor, valid_mask)))
+            clamped_stage_ids = expanded_stage_ids.long().clamp(min=0, max=self.route_num_stages - 1)
+            for stage_index in range(self.route_num_stages):
+                stage_fraction = (clamped_stage_ids == stage_index).float()
+                if valid_mask is not None:
+                    stage_fraction = stage_fraction * valid_mask
+                    denom = valid_mask.sum().clamp_min(1.0)
+                else:
+                    denom = torch.tensor(stage_fraction.numel(), device=stage_fraction.device, dtype=stage_fraction.dtype)
+                self.latest_stats[f"current_stage_frac_stage{stage_index}"] = float(stage_fraction.sum().item() / float(denom.item()))
         self.latest_stats.update(block_stats)
         self.latest_stats.update(
             {

@@ -14,6 +14,8 @@ class DenoisedModel(nn.Module):
         super(DenoisedModel, self).__init__()
         self.hidden_size = args.hidden_size
         self.decoder_type = args.dif_decoder
+        self.diffusion_steps = args.diffusion_steps
+        self.rescale_timesteps = args.rescale_timesteps
         if args.dif_decoder =='mlp':
             self.decoder = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size * 4),
                                         SiLU(),
@@ -42,6 +44,12 @@ class DenoisedModel(nn.Module):
             self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln_localattn_last')
         elif args.dif_decoder == 'mamba_tcond_input_adaln_localattn_all':
             self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln_localattn_all')
+        elif args.dif_decoder == 'mamba_tcond_input_adaln_stage_route_m':
+            self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln_stage_route_m')
+        elif args.dif_decoder == 'mamba_tcond_input_adaln_stage_route_f':
+            self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln_stage_route_f')
+        elif args.dif_decoder == 'mamba_tcond_input_adaln_stage_route_both':
+            self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln_stage_route_both')
         else:
             self.decoder = TransformerEncoder(args,num_blocks=2,norm_first=False,hidden_size=self.hidden_size)
 
@@ -86,6 +94,12 @@ class DenoisedModel(nn.Module):
             # rep_item = torch.where(mask.unsqueeze(-1), torch.zeros_like(rep_item), rep_item)
         t=t.reshape(x_t.shape[0],-1)
         time_emb = self.time_embed(self.timestep_embedding(t, self.hidden_size))
+        raw_t = t.float()
+        if self.rescale_timesteps:
+            raw_t = raw_t / (1000.0 / self.diffusion_steps)
+        raw_t = raw_t.clamp(min=0, max=self.diffusion_steps - 1)
+        route_num_stages = getattr(self.decoder, 'route_num_stages', 1)
+        stage_ids = torch.div(raw_t * route_num_stages, self.diffusion_steps, rounding_mode='floor').long().clamp(min=0, max=route_num_stages - 1)
         lambda_uncertainty = self.lambda_uncertainty  ### fixed
 
         rep_diffu = rep_item + lambda_uncertainty * (x_t + time_emb)
@@ -101,8 +115,11 @@ class DenoisedModel(nn.Module):
             'mamba_tcond_input_adaln',
             'mamba_tcond_input_adaln_localattn_last',
             'mamba_tcond_input_adaln_localattn_all',
+            'mamba_tcond_input_adaln_stage_route_m',
+            'mamba_tcond_input_adaln_stage_route_f',
+            'mamba_tcond_input_adaln_stage_route_both',
         }:
-            rep_diffu = self.decoder(rep_diffu, rep_item, mask_seq, time_emb)
+            rep_diffu = self.decoder(rep_diffu, rep_item, mask_seq, time_emb, stage_ids=stage_ids)
         elif self.decoder_type in {'mamba_tcond', 'mamba_tcond_ssm', 'mamba_tcond_ffn', 'mamba_tcond_input'}:
             rep_diffu = self.decoder(rep_diffu, mask_seq, time_emb)
         else:
