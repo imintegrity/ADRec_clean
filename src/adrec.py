@@ -38,6 +38,10 @@ class DenoisedModel(nn.Module):
             self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='adaln_only')
         elif args.dif_decoder == 'mamba_tcond_input_adaln':
             self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln')
+        elif args.dif_decoder == 'mamba_tcond_input_adaln_localattn_last':
+            self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln_localattn_last')
+        elif args.dif_decoder == 'mamba_tcond_input_adaln_localattn_all':
+            self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln_localattn_all')
         else:
             self.decoder = TransformerEncoder(args,num_blocks=2,norm_first=False,hidden_size=self.hidden_size)
 
@@ -93,7 +97,11 @@ class DenoisedModel(nn.Module):
             rep_diffu = self.decoder(state_input, rep_item, mask_seq, time_emb)
         elif self.decoder_type == 'mamba_adaln_only':
             rep_diffu = self.decoder(state_input, rep_item, mask_seq, time_emb)
-        elif self.decoder_type == 'mamba_tcond_input_adaln':
+        elif self.decoder_type in {
+            'mamba_tcond_input_adaln',
+            'mamba_tcond_input_adaln_localattn_last',
+            'mamba_tcond_input_adaln_localattn_all',
+        }:
             rep_diffu = self.decoder(rep_diffu, rep_item, mask_seq, time_emb)
         elif self.decoder_type in {'mamba_tcond', 'mamba_tcond_ssm', 'mamba_tcond_ffn', 'mamba_tcond_input'}:
             rep_diffu = self.decoder(rep_diffu, mask_seq, time_emb)

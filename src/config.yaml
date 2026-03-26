@@ -36,12 +36,16 @@ epoch_time_avg: false  # Calculate the average time of one epoch training
 # 'mamba_tcond', 'mamba_tcond_ssm',
 # 'mamba_tcond_ffn', 'mamba_tcond_input',
 # 'spc_mamba_nogate', 'spc_mamba',
-# 'mamba_adaln_only', 'mamba_tcond_input_adaln'
+# 'mamba_adaln_only', 'mamba_tcond_input_adaln',
+# 'mamba_tcond_input_adaln_localattn_last', 'mamba_tcond_input_adaln_localattn_all'
 dif_decoder: att
 mamba_d_state: 16
 mamba_d_conv: 4
 mamba_expand: 2
 tcond_gate_alpha_max: 0.1
+local_attn_window: 5
+local_attn_heads: 2
+local_attn_dim: 64
 split_onebyone: false  # Split sequence one by one
 noise_schedule: trunc_lin
 beta_a: 0.3 #beta_schedule

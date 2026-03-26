@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 try:
@@ -43,6 +44,69 @@ def prefixed_stats(prefix, stats):
         f"{prefix}_min": stats["min"],
         f"{prefix}_max": stats["max"],
     }
+
+
+class LocalSelfAttention(nn.Module):
+    def __init__(self, hidden_size, num_heads=2, window_size=5, attn_dim=None, causal=True):
+        super().__init__()
+        attn_dim = hidden_size if attn_dim is None else attn_dim
+        if attn_dim % num_heads != 0:
+            raise ValueError("local attention dim must be divisible by num_heads")
+        if window_size < 1:
+            raise ValueError("local attention window_size must be >= 1")
+
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.causal = causal
+        self.attn_dim = attn_dim
+        self.head_dim = attn_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(hidden_size, attn_dim * 3)
+        self.out_proj = nn.Linear(attn_dim, hidden_size)
+
+        nn.init.normal_(self.qkv.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.qkv.bias)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, hidden, valid_mask=None):
+        batch_size, seq_len, _ = hidden.shape
+        qkv = self.qkv(hidden).view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        if self.causal:
+            left_pad = self.window_size - 1
+            right_pad = 0
+            effective_window = self.window_size
+        else:
+            radius = self.window_size // 2
+            left_pad = radius
+            right_pad = radius
+            effective_window = left_pad + right_pad + 1
+
+        k_padded = F.pad(k, (0, 0, left_pad, right_pad))
+        v_padded = F.pad(v, (0, 0, left_pad, right_pad))
+        k_windows = k_padded.unfold(dimension=2, size=effective_window, step=1).permute(0, 1, 2, 4, 3)
+        v_windows = v_padded.unfold(dimension=2, size=effective_window, step=1).permute(0, 1, 2, 4, 3)
+
+        if valid_mask is None:
+            window_valid = hidden.new_ones(batch_size, seq_len, effective_window, dtype=torch.bool)
+        else:
+            mask_padded = F.pad(valid_mask.bool(), (left_pad, right_pad), value=False)
+            window_valid = mask_padded.unfold(dimension=1, size=effective_window, step=1)
+
+        attn_scores = torch.einsum("bhld,bhlwd->bhlw", q, k_windows) * self.scale
+        attn_scores = attn_scores.masked_fill(~window_valid.unsqueeze(1), -1e4)
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+        attn_probs = attn_probs * window_valid.unsqueeze(1).to(attn_probs.dtype)
+        attn_probs = attn_probs / attn_probs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        context = torch.einsum("bhlw,bhlwd->bhld", attn_probs, v_windows)
+        context = context.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, self.attn_dim)
+        return self.out_proj(context)
 
 
 class MambaBlock(nn.Module):
@@ -110,7 +174,21 @@ class MambaDenoiser(nn.Module):
 
 
 class AdaLNConditionalMambaBlock(nn.Module):
-    def __init__(self, hidden_size, dropout, alpha_max=0.1, use_input_coupling=False, d_state=16, d_conv=4, expand=2):
+    def __init__(
+        self,
+        hidden_size,
+        dropout,
+        alpha_max=0.1,
+        use_input_coupling=False,
+        use_local_attention=False,
+        local_attn_window=5,
+        local_attn_heads=2,
+        local_attn_dim=None,
+        causal=True,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+    ):
         super().__init__()
         if Mamba is None:
             raise ImportError(
@@ -118,6 +196,7 @@ class AdaLNConditionalMambaBlock(nn.Module):
             )
 
         self.use_input_coupling = use_input_coupling
+        self.use_local_attention = use_local_attention
         self.alpha_max = alpha_max
         self.norm1 = nn.LayerNorm(hidden_size)
         self.mamba = Mamba(
@@ -126,6 +205,17 @@ class AdaLNConditionalMambaBlock(nn.Module):
             d_conv=d_conv,
             expand=expand,
         )
+        self.norm_attn = nn.LayerNorm(hidden_size)
+        if self.use_local_attention:
+            self.local_attention = LocalSelfAttention(
+                hidden_size=hidden_size,
+                num_heads=local_attn_heads,
+                window_size=local_attn_window,
+                attn_dim=local_attn_dim,
+                causal=causal,
+            )
+        else:
+            self.local_attention = None
         self.norm2 = nn.LayerNorm(hidden_size)
         self.ffn = nn.Sequential(
             nn.Linear(hidden_size, hidden_size * 4),
@@ -133,9 +223,10 @@ class AdaLNConditionalMambaBlock(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size * 4, hidden_size),
         )
+        modulation_chunks = 9 if self.use_local_attention else 6
         self.modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size * 6),
+            nn.Linear(hidden_size, hidden_size * modulation_chunks),
         )
         self.input_modulation = nn.Sequential(
             nn.SiLU(),
@@ -146,7 +237,11 @@ class AdaLNConditionalMambaBlock(nn.Module):
         nn.init.zeros_(self.modulation[-1].weight)
         nn.init.zeros_(self.modulation[-1].bias)
         nn.init.constant_(self.modulation[-1].bias[2 * hidden_size:3 * hidden_size], -4.0)
-        nn.init.constant_(self.modulation[-1].bias[5 * hidden_size:6 * hidden_size], -4.0)
+        if self.use_local_attention:
+            nn.init.constant_(self.modulation[-1].bias[5 * hidden_size:6 * hidden_size], -4.0)
+            nn.init.constant_(self.modulation[-1].bias[8 * hidden_size:9 * hidden_size], -4.0)
+        else:
+            nn.init.constant_(self.modulation[-1].bias[5 * hidden_size:6 * hidden_size], -4.0)
         nn.init.zeros_(self.input_modulation[-1].weight)
         nn.init.zeros_(self.input_modulation[-1].bias)
 
@@ -161,7 +256,12 @@ class AdaLNConditionalMambaBlock(nn.Module):
             stats.update(prefixed_stats("adaln_input_shift", masked_tensor_stats(input_shift, valid_mask)))
             stats.update(prefixed_stats("adaln_input_scale", masked_tensor_stats(input_scale, valid_mask)))
 
-        shift_m, scale_m, gate_m_raw, shift_f, scale_f, gate_f_raw = self.modulation(cond_ctx).chunk(6, dim=-1)
+        if self.use_local_attention:
+            shift_m, scale_m, gate_m_raw, shift_a, scale_a, gate_a_raw, shift_f, scale_f, gate_f_raw = self.modulation(cond_ctx).chunk(9, dim=-1)
+            gate_a = self.alpha_max * torch.sigmoid(gate_a_raw)
+        else:
+            shift_m, scale_m, gate_m_raw, shift_f, scale_f, gate_f_raw = self.modulation(cond_ctx).chunk(6, dim=-1)
+            gate_a = None
         gate_m = self.alpha_max * torch.sigmoid(gate_m_raw)
         gate_f = self.alpha_max * torch.sigmoid(gate_f_raw)
 
@@ -170,6 +270,12 @@ class AdaLNConditionalMambaBlock(nn.Module):
         hidden_m = self.mamba(hidden_m)
         hidden = residual + gate_m * self.dropout(hidden_m)
 
+        if self.use_local_attention:
+            residual = hidden
+            hidden_a = modulate(self.norm_attn(hidden), shift_a, scale_a)
+            hidden_a = self.local_attention(hidden_a, valid_mask)
+            hidden = residual + gate_a * self.dropout(hidden_a)
+
         residual = hidden
         hidden_f = modulate(self.norm2(hidden), shift_f, scale_f)
         hidden_f = self.ffn(hidden_f)
@@ -177,6 +283,9 @@ class AdaLNConditionalMambaBlock(nn.Module):
 
         hidden = apply_mask(hidden, valid_mask)
         stats.update(prefixed_stats("adaln_gate_m", masked_tensor_stats(gate_m, valid_mask)))
+        if self.use_local_attention:
+            stats.update(prefixed_stats("adaln_gate_a", masked_tensor_stats(gate_a, valid_mask)))
+            stats.update(prefixed_stats("adaln_scale_a", masked_tensor_stats(scale_a, valid_mask)))
         stats.update(prefixed_stats("adaln_gate_f", masked_tensor_stats(gate_f, valid_mask)))
         stats.update(prefixed_stats("adaln_scale_m", masked_tensor_stats(scale_m, valid_mask)))
         stats.update(prefixed_stats("adaln_scale_f", masked_tensor_stats(scale_f, valid_mask)))
@@ -189,25 +298,47 @@ class AdaLNConditionalMambaDenoiser(nn.Module):
         self.latest_stats = {}
         self.mode = mode
         self.decoder_mode = mode
+        self.use_input_coupling = mode in {
+            "tcond_input_adaln",
+            "tcond_input_adaln_localattn_last",
+            "tcond_input_adaln_localattn_all",
+        }
+        self.local_attention_mode = {
+            "adaln_only": "none",
+            "tcond_input_adaln": "none",
+            "tcond_input_adaln_localattn_last": "last",
+            "tcond_input_adaln_localattn_all": "all",
+        }[mode]
         self.active_components = "mamba_state+adaln_modulation"
-        self.use_input_coupling = mode == "tcond_input_adaln"
+        if self.local_attention_mode != "none":
+            self.active_components += f"+local_attention_{self.local_attention_mode}"
         self.cond_proj = nn.Linear(args.hidden_size, args.hidden_size)
         self.time_proj = nn.Linear(args.hidden_size, args.hidden_size)
         self.input_proj = nn.Linear(args.hidden_size, args.hidden_size)
-        self.layers = nn.ModuleList(
-            [
+        self.local_attn_window = getattr(args, "local_attn_window", 5)
+        self.local_attn_heads = getattr(args, "local_attn_heads", 2)
+        self.local_attn_dim = getattr(args, "local_attn_dim", 0) or None
+        self.layers = nn.ModuleList()
+        for layer_index in range(num_blocks):
+            use_local_attention = self.local_attention_mode == "all" or (
+                self.local_attention_mode == "last" and layer_index == num_blocks - 1
+            )
+            self.layers.append(
                 AdaLNConditionalMambaBlock(
                     hidden_size=args.hidden_size,
                     dropout=args.dropout,
                     alpha_max=args.tcond_gate_alpha_max,
                     use_input_coupling=self.use_input_coupling,
+                    use_local_attention=use_local_attention,
+                    local_attn_window=self.local_attn_window,
+                    local_attn_heads=self.local_attn_heads,
+                    local_attn_dim=self.local_attn_dim,
+                    causal=getattr(args, "is_causal", True),
                     d_state=args.mamba_d_state,
                     d_conv=args.mamba_d_conv,
                     expand=args.mamba_expand,
                 )
-                for _ in range(num_blocks)
-            ]
-        )
+            )
 
         nn.init.normal_(self.cond_proj.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.cond_proj.bias)
@@ -229,6 +360,10 @@ class AdaLNConditionalMambaDenoiser(nn.Module):
         self.latest_stats = {
             "adaln_mode": self.mode,
             "adaln_active_components": self.active_components,
+            "adaln_local_attention_mode": self.local_attention_mode,
+            "adaln_local_attention_window": self.local_attn_window,
+            "adaln_local_attention_heads": self.local_attn_heads,
+            "adaln_local_attention_dim": self.input_proj.out_features if self.local_attn_dim is None else self.local_attn_dim,
         }
         self.latest_stats.update(block_stats)
         self.latest_stats.update(

@@ -106,6 +106,9 @@ def build_efficiency_report(model_joint, args):
     return {
         'dif_decoder': args.dif_decoder,
         'tcond_gate_alpha_max': getattr(args, 'tcond_gate_alpha_max', None),
+        'local_attn_window': getattr(args, 'local_attn_window', None),
+        'local_attn_heads': getattr(args, 'local_attn_heads', None),
+        'local_attn_dim': getattr(args, 'local_attn_dim', None),
         'decoder_mode': getattr(decoder, 'decoder_mode', None),
         'decoder_active_components': getattr(decoder, 'active_components', None),
         'tcond_placement': getattr(getattr(diffu_net, 'decoder', None), 'placement', None),
