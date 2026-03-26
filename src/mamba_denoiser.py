@@ -46,6 +46,22 @@ def prefixed_stats(prefix, stats):
     }
 
 
+class BottleneckAdapter(nn.Module):
+    def __init__(self, hidden_size, bottleneck_size):
+        super().__init__()
+        self.down_proj = nn.Linear(hidden_size, bottleneck_size)
+        self.act = nn.SiLU()
+        self.up_proj = nn.Linear(bottleneck_size, hidden_size)
+
+        nn.init.normal_(self.down_proj.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.down_proj.bias)
+        nn.init.zeros_(self.up_proj.weight)
+        nn.init.zeros_(self.up_proj.bias)
+
+    def forward(self, hidden):
+        return self.up_proj(self.act(self.down_proj(hidden)))
+
+
 class StageChannelRouter(nn.Module):
     def __init__(
         self,
@@ -256,6 +272,11 @@ class AdaLNConditionalMambaBlock(nn.Module):
         route_shared_ratio=0.5,
         route_extra_ratio_low=0.125,
         route_extra_ratio_high=0.375,
+        ffn_adapter_mode="none",
+        ffn_adapter_num_stages=4,
+        ffn_adapter_ctx_num_stages=2,
+        ffn_adapter_bottleneck_ratio=0.25,
+        ffn_adapter_use_global=False,
         d_state=16,
         d_conv=4,
         expand=2,
@@ -270,6 +291,12 @@ class AdaLNConditionalMambaBlock(nn.Module):
         self.use_local_attention = use_local_attention
         self.route_m_enabled = route_m
         self.route_f_enabled = route_f
+        self.ffn_adapter_mode = ffn_adapter_mode
+        self.ffn_adapter_enabled = ffn_adapter_mode != "none"
+        self.ffn_adapter_use_ctx = ffn_adapter_mode in {"tsm", "tsm_noglobal"}
+        self.ffn_adapter_use_global = ffn_adapter_use_global and ffn_adapter_mode == "tsm"
+        self.ffn_adapter_num_stages = ffn_adapter_num_stages
+        self.ffn_adapter_ctx_num_stages = ffn_adapter_ctx_num_stages
         self.alpha_max = alpha_max
         self.norm1 = nn.LayerNorm(hidden_size)
         self.mamba = Mamba(
@@ -303,6 +330,22 @@ class AdaLNConditionalMambaBlock(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size * 4, hidden_size),
         )
+        adapter_bottleneck = max(4, int(round(hidden_size * ffn_adapter_bottleneck_ratio)))
+        self.ffn_adapter_core = nn.ModuleList(
+            [BottleneckAdapter(hidden_size, adapter_bottleneck) for _ in range(ffn_adapter_num_stages)]
+        ) if self.ffn_adapter_enabled else None
+        self.ffn_adapter_ctx = nn.ModuleList(
+            [BottleneckAdapter(hidden_size, adapter_bottleneck) for _ in range(ffn_adapter_ctx_num_stages)]
+        ) if self.ffn_adapter_use_ctx else None
+        self.ffn_adapter_global = BottleneckAdapter(hidden_size, adapter_bottleneck) if self.ffn_adapter_use_global else None
+        self.ffn_adapter_ctx_gate = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 1),
+        ) if self.ffn_adapter_use_ctx else None
+        self.ffn_adapter_global_gate = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 1),
+        ) if self.ffn_adapter_use_global else None
         self.route_f = StageChannelRouter(
             hidden_size=hidden_size,
             num_stages=route_num_stages,
@@ -331,6 +374,32 @@ class AdaLNConditionalMambaBlock(nn.Module):
             nn.init.constant_(self.modulation[-1].bias[5 * hidden_size:6 * hidden_size], -4.0)
         nn.init.zeros_(self.input_modulation[-1].weight)
         nn.init.zeros_(self.input_modulation[-1].bias)
+        if self.ffn_adapter_ctx_gate is not None:
+            nn.init.zeros_(self.ffn_adapter_ctx_gate[-1].weight)
+            nn.init.constant_(self.ffn_adapter_ctx_gate[-1].bias, -4.0)
+        if self.ffn_adapter_global_gate is not None:
+            nn.init.zeros_(self.ffn_adapter_global_gate[-1].weight)
+            nn.init.constant_(self.ffn_adapter_global_gate[-1].bias, -4.0)
+
+    def _expand_stage_ids(self, stage_ids, target_seq_len):
+        if stage_ids is None:
+            return None
+        if stage_ids.dim() == 1:
+            stage_ids = stage_ids.unsqueeze(-1)
+        if stage_ids.size(1) == 1 and target_seq_len != 1:
+            stage_ids = stage_ids.expand(-1, target_seq_len)
+        return stage_ids.long()
+
+    def _apply_indexed_adapters(self, adapters, hidden, stage_ids, num_stages):
+        adapter_output = hidden.new_zeros(hidden.shape)
+        if stage_ids is None:
+            return adapter_output
+        clamped_stage_ids = stage_ids.clamp(min=0, max=num_stages - 1)
+        for stage_index, adapter in enumerate(adapters):
+            stage_mask = (clamped_stage_ids == stage_index).unsqueeze(-1).to(hidden.dtype)
+            if stage_mask.any():
+                adapter_output = adapter_output + adapter(hidden) * stage_mask
+        return adapter_output
 
     def forward(self, hidden, cond_ctx, valid_mask=None, stage_ids=None):
         hidden = apply_mask(hidden, valid_mask)
@@ -367,9 +436,53 @@ class AdaLNConditionalMambaBlock(nn.Module):
 
         residual = hidden
         hidden_f = modulate(self.norm2(hidden), shift_f, scale_f)
-        hidden_f = self.ffn(hidden_f)
+        ffn_hidden = hidden_f
+        hidden_f = self.ffn(ffn_hidden)
         if self.route_f is not None:
             hidden_f = self.route_f(hidden_f, stage_ids)
+        if self.ffn_adapter_enabled:
+            expanded_stage_ids = self._expand_stage_ids(stage_ids, hidden.size(1))
+            adapter_core = self._apply_indexed_adapters(
+                self.ffn_adapter_core,
+                ffn_hidden,
+                expanded_stage_ids,
+                self.ffn_adapter_num_stages,
+            )
+            adapter_total = adapter_core
+            stats.update(prefixed_stats("ffn_adapter_core_norm", masked_tensor_stats(adapter_core.norm(dim=-1), valid_mask)))
+            if expanded_stage_ids is not None:
+                for stage_index in range(self.ffn_adapter_num_stages):
+                    stage_usage = (expanded_stage_ids == stage_index).float()
+                    if valid_mask is not None:
+                        stage_usage = stage_usage * valid_mask
+                        denom = valid_mask.sum().clamp_min(1.0)
+                    else:
+                        denom = torch.tensor(stage_usage.numel(), device=stage_usage.device, dtype=stage_usage.dtype)
+                    stats[f"ffn_adapter_core_usage_stage{stage_index}"] = (stage_usage.sum() / denom).detach()
+            if self.ffn_adapter_use_ctx:
+                coarse_stage_ids = None if expanded_stage_ids is None else torch.div(
+                    expanded_stage_ids * self.ffn_adapter_ctx_num_stages,
+                    self.ffn_adapter_num_stages,
+                    rounding_mode='floor',
+                ).clamp(min=0, max=self.ffn_adapter_ctx_num_stages - 1)
+                adapter_ctx = self._apply_indexed_adapters(
+                    self.ffn_adapter_ctx,
+                    ffn_hidden,
+                    coarse_stage_ids,
+                    self.ffn_adapter_ctx_num_stages,
+                )
+                ctx_weight = torch.sigmoid(self.ffn_adapter_ctx_gate(cond_ctx))
+                adapter_total = adapter_total + ctx_weight * adapter_ctx
+                stats.update(prefixed_stats("ffn_adapter_ctx_weight", masked_tensor_stats(ctx_weight, valid_mask)))
+                stats.update(prefixed_stats("ffn_adapter_ctx_norm", masked_tensor_stats(adapter_ctx.norm(dim=-1), valid_mask)))
+            if self.ffn_adapter_use_global:
+                adapter_global = self.ffn_adapter_global(ffn_hidden)
+                global_weight = torch.sigmoid(self.ffn_adapter_global_gate(cond_ctx))
+                adapter_total = adapter_total + global_weight * adapter_global
+                stats.update(prefixed_stats("ffn_adapter_global_weight", masked_tensor_stats(global_weight, valid_mask)))
+                stats.update(prefixed_stats("ffn_adapter_global_norm", masked_tensor_stats(adapter_global.norm(dim=-1), valid_mask)))
+            stats.update(prefixed_stats("ffn_adapter_total_norm", masked_tensor_stats(adapter_total.norm(dim=-1), valid_mask)))
+            hidden_f = hidden_f + adapter_total
         hidden = residual + gate_f * self.dropout(hidden_f)
 
         hidden = apply_mask(hidden, valid_mask)
@@ -396,6 +509,9 @@ class AdaLNConditionalMambaDenoiser(nn.Module):
             "tcond_input_adaln_stage_route_m",
             "tcond_input_adaln_stage_route_f",
             "tcond_input_adaln_stage_route_both",
+            "tcond_input_adaln_ffn_stage_adapter",
+            "tcond_input_adaln_ffn_tsm_adapter",
+            "tcond_input_adaln_ffn_tsm_adapter_noglobal",
         }
         self.local_attention_mode = {
             "adaln_only": "none",
@@ -405,6 +521,9 @@ class AdaLNConditionalMambaDenoiser(nn.Module):
             "tcond_input_adaln_stage_route_m": "none",
             "tcond_input_adaln_stage_route_f": "none",
             "tcond_input_adaln_stage_route_both": "none",
+            "tcond_input_adaln_ffn_stage_adapter": "none",
+            "tcond_input_adaln_ffn_tsm_adapter": "none",
+            "tcond_input_adaln_ffn_tsm_adapter_noglobal": "none",
         }[mode]
         self.stage_routing_mode = {
             "adaln_only": "none",
@@ -414,22 +533,44 @@ class AdaLNConditionalMambaDenoiser(nn.Module):
             "tcond_input_adaln_stage_route_m": "m",
             "tcond_input_adaln_stage_route_f": "f",
             "tcond_input_adaln_stage_route_both": "both",
+            "tcond_input_adaln_ffn_stage_adapter": "none",
+            "tcond_input_adaln_ffn_tsm_adapter": "none",
+            "tcond_input_adaln_ffn_tsm_adapter_noglobal": "none",
+        }[mode]
+        self.ffn_adapter_mode = {
+            "adaln_only": "none",
+            "tcond_input_adaln": "none",
+            "tcond_input_adaln_localattn_last": "none",
+            "tcond_input_adaln_localattn_all": "none",
+            "tcond_input_adaln_stage_route_m": "none",
+            "tcond_input_adaln_stage_route_f": "none",
+            "tcond_input_adaln_stage_route_both": "none",
+            "tcond_input_adaln_ffn_stage_adapter": "stage",
+            "tcond_input_adaln_ffn_tsm_adapter": "tsm",
+            "tcond_input_adaln_ffn_tsm_adapter_noglobal": "tsm_noglobal",
         }[mode]
         self.active_components = "mamba_state+adaln_modulation"
         if self.local_attention_mode != "none":
             self.active_components += f"+local_attention_{self.local_attention_mode}"
         if self.stage_routing_mode != "none":
             self.active_components += f"+stage_route_{self.stage_routing_mode}"
+        if self.ffn_adapter_mode != "none":
+            self.active_components += f"+ffn_adapter_{self.ffn_adapter_mode}"
         self.cond_proj = nn.Linear(args.hidden_size, args.hidden_size)
         self.time_proj = nn.Linear(args.hidden_size, args.hidden_size)
         self.input_proj = nn.Linear(args.hidden_size, args.hidden_size)
         self.local_attn_window = getattr(args, "local_attn_window", 5)
         self.local_attn_heads = getattr(args, "local_attn_heads", 2)
         self.local_attn_dim = getattr(args, "local_attn_dim", 0) or None
+        self.stage_num_buckets = getattr(args, "ffn_adapter_num_stages", getattr(args, "route_num_stages", 4))
         self.route_num_stages = getattr(args, "route_num_stages", 4)
         self.route_shared_ratio = getattr(args, "route_shared_ratio", 0.5)
         self.route_extra_ratio_low = getattr(args, "route_extra_ratio_low", 0.125)
         self.route_extra_ratio_high = getattr(args, "route_extra_ratio_high", 0.375)
+        self.ffn_adapter_num_stages = getattr(args, "ffn_adapter_num_stages", 4)
+        self.ffn_adapter_ctx_num_stages = getattr(args, "ffn_adapter_ctx_num_stages", 2)
+        self.ffn_adapter_bottleneck_ratio = getattr(args, "ffn_adapter_bottleneck_ratio", 0.25)
+        self.ffn_adapter_use_global = self.ffn_adapter_mode == "tsm"
         self.layers = nn.ModuleList()
         for layer_index in range(num_blocks):
             use_local_attention = self.local_attention_mode == "all" or (
@@ -452,6 +593,11 @@ class AdaLNConditionalMambaDenoiser(nn.Module):
                     route_shared_ratio=self.route_shared_ratio,
                     route_extra_ratio_low=self.route_extra_ratio_low,
                     route_extra_ratio_high=self.route_extra_ratio_high,
+                    ffn_adapter_mode=self.ffn_adapter_mode,
+                    ffn_adapter_num_stages=self.ffn_adapter_num_stages,
+                    ffn_adapter_ctx_num_stages=self.ffn_adapter_ctx_num_stages,
+                    ffn_adapter_bottleneck_ratio=self.ffn_adapter_bottleneck_ratio,
+                    ffn_adapter_use_global=self.ffn_adapter_use_global,
                     d_state=args.mamba_d_state,
                     d_conv=args.mamba_d_conv,
                     expand=args.mamba_expand,
@@ -511,12 +657,18 @@ class AdaLNConditionalMambaDenoiser(nn.Module):
             "route_extra_ratio_low": self.route_extra_ratio_low,
             "route_extra_ratio_high": self.route_extra_ratio_high,
             "route_stage_routing_mode": self.stage_routing_mode,
+            "ffn_adapter_mode": self.ffn_adapter_mode,
+            "stage_num_buckets": self.stage_num_buckets,
+            "ffn_adapter_num_stages": self.ffn_adapter_num_stages,
+            "ffn_adapter_ctx_num_stages": self.ffn_adapter_ctx_num_stages,
+            "ffn_adapter_bottleneck_ratio": self.ffn_adapter_bottleneck_ratio,
+            "ffn_adapter_use_global": int(self.ffn_adapter_use_global),
         }
         if expanded_stage_ids is not None:
             stage_tensor = expanded_stage_ids.float()
             self.latest_stats.update(prefixed_stats("current_stage_id", masked_tensor_stats(stage_tensor, valid_mask)))
-            clamped_stage_ids = expanded_stage_ids.long().clamp(min=0, max=self.route_num_stages - 1)
-            for stage_index in range(self.route_num_stages):
+            clamped_stage_ids = expanded_stage_ids.long().clamp(min=0, max=self.stage_num_buckets - 1)
+            for stage_index in range(self.stage_num_buckets):
                 stage_fraction = (clamped_stage_ids == stage_index).float()
                 if valid_mask is not None:
                     stage_fraction = stage_fraction * valid_mask

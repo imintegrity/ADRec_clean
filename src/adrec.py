@@ -50,6 +50,12 @@ class DenoisedModel(nn.Module):
             self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln_stage_route_f')
         elif args.dif_decoder == 'mamba_tcond_input_adaln_stage_route_both':
             self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln_stage_route_both')
+        elif args.dif_decoder == 'mamba_tcond_input_adaln_ffn_stage_adapter':
+            self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln_ffn_stage_adapter')
+        elif args.dif_decoder == 'mamba_tcond_input_adaln_ffn_tsm_adapter':
+            self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln_ffn_tsm_adapter')
+        elif args.dif_decoder == 'mamba_tcond_input_adaln_ffn_tsm_adapter_noglobal':
+            self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln_ffn_tsm_adapter_noglobal')
         else:
             self.decoder = TransformerEncoder(args,num_blocks=2,norm_first=False,hidden_size=self.hidden_size)
 
@@ -98,8 +104,8 @@ class DenoisedModel(nn.Module):
         if self.rescale_timesteps:
             raw_t = raw_t / (1000.0 / self.diffusion_steps)
         raw_t = raw_t.clamp(min=0, max=self.diffusion_steps - 1)
-        route_num_stages = getattr(self.decoder, 'route_num_stages', 1)
-        stage_ids = torch.div(raw_t * route_num_stages, self.diffusion_steps, rounding_mode='floor').long().clamp(min=0, max=route_num_stages - 1)
+        stage_num_buckets = getattr(self.decoder, 'stage_num_buckets', getattr(self.decoder, 'route_num_stages', 1))
+        stage_ids = torch.div(raw_t * stage_num_buckets, self.diffusion_steps, rounding_mode='floor').long().clamp(min=0, max=stage_num_buckets - 1)
         lambda_uncertainty = self.lambda_uncertainty  ### fixed
 
         rep_diffu = rep_item + lambda_uncertainty * (x_t + time_emb)
@@ -118,6 +124,9 @@ class DenoisedModel(nn.Module):
             'mamba_tcond_input_adaln_stage_route_m',
             'mamba_tcond_input_adaln_stage_route_f',
             'mamba_tcond_input_adaln_stage_route_both',
+            'mamba_tcond_input_adaln_ffn_stage_adapter',
+            'mamba_tcond_input_adaln_ffn_tsm_adapter',
+            'mamba_tcond_input_adaln_ffn_tsm_adapter_noglobal',
         }:
             rep_diffu = self.decoder(rep_diffu, rep_item, mask_seq, time_emb, stage_ids=stage_ids)
         elif self.decoder_type in {'mamba_tcond', 'mamba_tcond_ssm', 'mamba_tcond_ffn', 'mamba_tcond_input'}:
