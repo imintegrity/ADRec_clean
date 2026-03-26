@@ -147,6 +147,10 @@ def is_numeric_stat(value):
     return isinstance(value, (int, float))
 
 
+def loss_requires_grad(loss_tensor):
+    return isinstance(loss_tensor, torch.Tensor) and loss_tensor.requires_grad
+
+
 def save_efficiency_report(report, args, train_time):
     saved_dir = os.path.join('saved', args.model, args.dataset)
     if not os.path.exists(saved_dir):
@@ -203,11 +207,16 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             item_consistency_loss = outputs[3] if len(outputs) > 3 and outputs[3] is not None else torch.zeros(1, device=args.device)
             ce_loss = model_joint.calculate_loss(out_seq, train_batch[1])  ## use this not above
             if args.model=='adrec' and args.loss=='mse':
-                losses = [ce_loss, args.loss_scale * dif_loss]
+                candidate_losses = [ce_loss, args.loss_scale * dif_loss]
                 if getattr(args, 'lambda_item', 0.0) > 0:
-                    losses.append(args.lambda_item * item_consistency_loss)
+                    candidate_losses.append(args.lambda_item * item_consistency_loss)
+                losses = [loss for loss in candidate_losses if loss_requires_grad(loss)]
+                if not losses:
+                    losses = [ce_loss]
             elif args.model=='dreamrec':
-                losses =[dif_loss]
+                losses = [loss for loss in [dif_loss] if loss_requires_grad(loss)]
+                if not losses:
+                    losses = [ce_loss]
             else:
                 losses=[ce_loss]
             optimizer.pc_backward(losses)
