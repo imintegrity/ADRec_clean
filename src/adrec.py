@@ -56,6 +56,10 @@ class DenoisedModel(nn.Module):
             self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln_ffn_tsm_adapter')
         elif args.dif_decoder == 'mamba_tcond_input_adaln_ffn_tsm_adapter_noglobal':
             self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln_ffn_tsm_adapter_noglobal')
+        elif args.dif_decoder == 'mamba_tcond_input_adaln_item_consistency_all':
+            self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln')
+        elif args.dif_decoder == 'mamba_tcond_input_adaln_item_consistency_snr':
+            self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln')
         else:
             self.decoder = TransformerEncoder(args,num_blocks=2,norm_first=False,hidden_size=self.hidden_size)
 
@@ -127,6 +131,8 @@ class DenoisedModel(nn.Module):
             'mamba_tcond_input_adaln_ffn_stage_adapter',
             'mamba_tcond_input_adaln_ffn_tsm_adapter',
             'mamba_tcond_input_adaln_ffn_tsm_adapter_noglobal',
+            'mamba_tcond_input_adaln_item_consistency_all',
+            'mamba_tcond_input_adaln_item_consistency_snr',
         }:
             rep_diffu = self.decoder(rep_diffu, rep_item, mask_seq, time_emb, stage_ids=stage_ids)
         elif self.decoder_type in {'mamba_tcond', 'mamba_tcond_ssm', 'mamba_tcond_ffn', 'mamba_tcond_input'}:
@@ -307,7 +313,7 @@ class AdRec(nn.Module):
         # print(denoised_seq.shape,item_tag.shape,mask_tag.shape)
         losses = F.mse_loss(denoised_seq,item_tag, reduction='none')* (mask_tag / mask_tag.sum(1,keepdim=True)).unsqueeze(-1)
         losses = losses.sum(1).mean()
-        return denoised_seq, losses
+        return denoised_seq, losses, t
 
 
 

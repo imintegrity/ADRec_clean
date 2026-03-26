@@ -116,6 +116,9 @@ def build_efficiency_report(model_joint, args):
         'ffn_adapter_num_stages': getattr(args, 'ffn_adapter_num_stages', None),
         'ffn_adapter_ctx_num_stages': getattr(args, 'ffn_adapter_ctx_num_stages', None),
         'ffn_adapter_bottleneck_ratio': getattr(args, 'ffn_adapter_bottleneck_ratio', None),
+        'lambda_item': getattr(args, 'lambda_item', None),
+        'item_consistency_temperature': getattr(args, 'item_consistency_temperature', None),
+        'item_consistency_snr_power': getattr(args, 'item_consistency_snr_power', None),
         'decoder_mode': getattr(decoder, 'decoder_mode', None),
         'decoder_active_components': getattr(decoder, 'active_components', None),
         'tcond_placement': getattr(getattr(diffu_net, 'decoder', None), 'placement', None),
@@ -131,10 +134,13 @@ def build_efficiency_report(model_joint, args):
 
 
 def get_tcond_stats(model_joint):
+    merged_stats = {}
     decoder = getattr(getattr(getattr(model_joint, 'diffu', None), 'net', None), 'decoder', None)
-    if decoder is None or not hasattr(decoder, 'get_latest_stats'):
-        return {}
-    return decoder.get_latest_stats()
+    if decoder is not None and hasattr(decoder, 'get_latest_stats'):
+        merged_stats.update(decoder.get_latest_stats())
+    if hasattr(model_joint, 'get_latest_aux_stats'):
+        merged_stats.update(model_joint.get_latest_aux_stats())
+    return merged_stats
 
 
 def is_numeric_stat(value):
@@ -177,6 +183,7 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             model_joint.item_embedding.weight.requires_grad = True
         ce_losses = []
         dif_losses = []
+        item_losses = []
         epoch_tcond_stats = {}
         flag_update = 0
         epoch_samples = 0
@@ -190,14 +197,15 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             train_batch = [x.to(device) for x in train_batch]
             epoch_samples += train_batch[0].shape[0]
             optimizer.zero_grad()
-            out_seq, last_item, *dif_loss = model_joint(train_batch[0], train_batch[1], train_flag=True)
-            if len(dif_loss)>0:
-                dif_loss=dif_loss[0]
-            else:
-                dif_loss=torch.zeros(1,device=args.device)
+            outputs = model_joint(train_batch[0], train_batch[1], train_flag=True)
+            out_seq, last_item = outputs[:2]
+            dif_loss = outputs[2] if len(outputs) > 2 and outputs[2] is not None else torch.zeros(1, device=args.device)
+            item_consistency_loss = outputs[3] if len(outputs) > 3 and outputs[3] is not None else torch.zeros(1, device=args.device)
             ce_loss = model_joint.calculate_loss(out_seq, train_batch[1])  ## use this not above
             if args.model=='adrec' and args.loss=='mse':
                 losses = [ce_loss, args.loss_scale * dif_loss]
+                if getattr(args, 'lambda_item', 0.0) > 0:
+                    losses.append(args.lambda_item * item_consistency_loss)
             elif args.model=='dreamrec':
                 losses =[dif_loss]
             else:
@@ -205,6 +213,7 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             optimizer.pc_backward(losses)
             ce_losses.append(ce_loss.item())
             dif_losses.append(dif_loss.item())
+            item_losses.append(item_consistency_loss.item())
             current_tcond_stats = get_tcond_stats(model_joint)
             for key, value in current_tcond_stats.items():
                 if is_numeric_stat(value):
@@ -221,8 +230,9 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
         peak_memory_mb = 0.0
         if is_cuda_device(device):
             peak_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-        print(f"loss in epoch {epoch_temp}: ce_loss {sum(ce_losses)/len(ce_losses):.3f}, dif_loss {sum(dif_losses)/len(dif_losses):.3f}")
-        logger.info(f"loss in epoch {epoch_temp}: ce_loss {sum(ce_losses)/len(ce_losses):.3f}, dif_loss {sum(dif_losses)/len(dif_losses):.3f}")
+        avg_item_loss = sum(item_losses) / len(item_losses) if item_losses else 0.0
+        print(f"loss in epoch {epoch_temp}: ce_loss {sum(ce_losses)/len(ce_losses):.3f}, dif_loss {sum(dif_losses)/len(dif_losses):.3f}, item_loss {avg_item_loss:.3f}")
+        logger.info(f"loss in epoch {epoch_temp}: ce_loss {sum(ce_losses)/len(ce_losses):.3f}, dif_loss {sum(dif_losses)/len(dif_losses):.3f}, item_loss {avg_item_loss:.3f}")
         logger.info(
             "epoch %d efficiency: epoch_time_sec=%.4f avg_step_time_sec=%.6f samples_per_sec=%.4f peak_gpu_mem_mb=%.2f",
             epoch_temp,

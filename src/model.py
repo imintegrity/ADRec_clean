@@ -31,6 +31,14 @@ class Att_Diffuse_model(nn.Module):
         # self.per_token_ag = args.per_token_ag
 
         self.geodesic = args.geodesic
+        self.item_consistency_mode = {
+            'mamba_tcond_input_adaln_item_consistency_all': 'all',
+            'mamba_tcond_input_adaln_item_consistency_snr': 'snr',
+        }.get(args.dif_decoder, 'none')
+        self.lambda_item = getattr(args, 'lambda_item', 0.0)
+        self.item_consistency_temperature = getattr(args, 'item_consistency_temperature', 0.07)
+        self.item_consistency_snr_power = getattr(args, 'item_consistency_snr_power', 1.0)
+        self.latest_item_consistency_stats = {}
     def load_pretrained_emb_weight(self):
 
         path = os.path.join('saved','pretrain',self.args.dataset, 'pretrain.pth')
@@ -124,6 +132,64 @@ class Att_Diffuse_model(nn.Module):
     def calculate_score(self, item):
         scores = torch.matmul(item.reshape(-1, item.shape[-1]), self.item_embedding.weight.t())
         return scores
+
+    def compute_item_consistency_loss(self, denoised_seq, labels, t):
+        if self.item_consistency_mode == 'none' or self.lambda_item <= 0:
+            self.latest_item_consistency_stats = {
+                'item_consistency_loss': 0.0,
+                'lambda_item': float(self.lambda_item),
+            }
+            return denoised_seq.new_zeros(())
+
+        valid_mask = labels > 0
+        if not valid_mask.any():
+            self.latest_item_consistency_stats = {
+                'item_consistency_loss': 0.0,
+                'lambda_item': float(self.lambda_item),
+            }
+            return denoised_seq.new_zeros(())
+
+        if t.dim() == 1:
+            t = t.unsqueeze(-1)
+        if t.size(1) == 1 and labels.size(1) != 1:
+            t = t.expand(-1, labels.size(1))
+        t = t.long().clamp(min=0, max=self.diffu.num_timesteps - 1)
+
+        x0_norm = F.normalize(denoised_seq, dim=-1)
+        item_emb_norm = F.normalize(self.item_embedding.weight, dim=-1)
+        item_logits = torch.matmul(x0_norm, item_emb_norm.t()) / self.item_consistency_temperature
+
+        flat_logits = item_logits[valid_mask]
+        flat_labels = labels[valid_mask]
+        ce_per_token = F.cross_entropy(flat_logits, flat_labels, reduction='none')
+        flat_timesteps = t[valid_mask].float()
+
+        if self.item_consistency_mode == 'snr':
+            alpha_bar = torch.as_tensor(self.diffu.alphas_cumprod, device=denoised_seq.device, dtype=denoised_seq.dtype)
+            item_weights = alpha_bar[t].pow(self.item_consistency_snr_power)
+        else:
+            item_weights = denoised_seq.new_ones(labels.shape, dtype=denoised_seq.dtype)
+        flat_weights = item_weights[valid_mask]
+        item_consistency_loss = (ce_per_token * flat_weights).sum() / flat_weights.sum().clamp_min(1e-6)
+
+        pos_logits = flat_logits.gather(-1, flat_labels.unsqueeze(-1)).squeeze(-1)
+        neg_logits_mean = (flat_logits.sum(dim=-1) - pos_logits) / max(flat_logits.shape[-1] - 1, 1)
+        top1_acc = (flat_logits.argmax(dim=-1) == flat_labels).float().mean()
+        self.latest_item_consistency_stats = {
+            'item_consistency_loss': float(item_consistency_loss.detach().item()),
+            'lambda_item': float(self.lambda_item),
+            'current_timestep_mean': float(flat_timesteps.mean().detach().item()),
+            'current_timestep_std': float(flat_timesteps.std(unbiased=False).detach().item()),
+            'item_consistency_weight_mean': float(flat_weights.mean().detach().item()),
+            'item_consistency_weight_std': float(flat_weights.std(unbiased=False).detach().item()),
+            'x0_item_pos_logit_mean': float(pos_logits.mean().detach().item()),
+            'x0_item_neg_logit_mean': float(neg_logits_mean.mean().detach().item()),
+            'x0_item_top1_acc': float(top1_acc.detach().item()),
+        }
+        return item_consistency_loss
+
+    def get_latest_aux_stats(self):
+        return dict(self.latest_item_consistency_stats)
     
     def loss_rmse(self, rep_diffu, labels):
         rep_gt = self.item_embedding(labels).squeeze(1)
@@ -149,8 +215,11 @@ class Att_Diffuse_model(nn.Module):
         if train_flag:
             # pass
 
-            out_seq, dif_loss = self.diffu(item_embeddings, tag_embeddings, mask_seq, mask_tag)
+            diffu_outputs = self.diffu(item_embeddings, tag_embeddings, mask_seq, mask_tag)
+            out_seq, dif_loss = diffu_outputs[:2]
+            timesteps = diffu_outputs[2] if len(diffu_outputs) > 2 else None
             last_item = out_seq[:, -1, :]
+            item_consistency_loss = self.compute_item_consistency_loss(out_seq, tag, timesteps) if timesteps is not None else out_seq.new_zeros(())
 
             # item_rep_dis = self.regularization_rep(rep_item, mask_seq)
             # seq_rep_dis = self.regularization_seq_item_rep(last_item, rep_item, mask_seq)
@@ -162,11 +231,13 @@ class Att_Diffuse_model(nn.Module):
             # out_seq = self.diffu.subseq_guidence(item_embeddings, tag_embeddings, mask_seq, mask_tag)
             last_item = out_seq[:, -1, :]
             dif_loss = None
+            item_consistency_loss = None
+            self.latest_item_consistency_stats = {}
         # item_rep = self.model_main(item_embeddings, last_item, mask_seq)
         # seq_rep = item_rep[:, -1, :]
         # scores = torch.matmul(seq_rep, self.item_embeddings.weight.t())
             # scores = None
-        return out_seq, last_item, dif_loss
+        return out_seq, last_item, dif_loss, item_consistency_loss
 
     def denoise_sample_only(self, sequence, tag):
         item_embeddings, tag_embeddings, mask_seq, mask_tag = self.prepare_inputs(sequence, tag)
