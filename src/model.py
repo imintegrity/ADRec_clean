@@ -150,9 +150,17 @@ class Att_Diffuse_model(nn.Module):
             return denoised_seq.new_zeros(())
 
         if t.dim() == 1:
-            t = t.unsqueeze(-1)
-        if t.size(1) == 1 and labels.size(1) != 1:
-            t = t.expand(-1, labels.size(1))
+            if t.numel() == labels.numel():
+                t = t.reshape_as(labels)
+            else:
+                t = t.unsqueeze(-1)
+        if t.dim() == 2 and t.shape != labels.shape:
+            if t.numel() == labels.numel():
+                t = t.reshape_as(labels)
+            elif t.size(1) == 1 and labels.size(1) != 1:
+                t = t.expand(-1, labels.size(1))
+        if t.shape != labels.shape:
+            raise ValueError(f"unexpected timestep shape {tuple(t.shape)} for labels shape {tuple(labels.shape)}")
         t = t.long().clamp(min=0, max=self.diffu.num_timesteps - 1)
 
         x0_norm = F.normalize(denoised_seq, dim=-1)
