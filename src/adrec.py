@@ -60,6 +60,10 @@ class DenoisedModel(nn.Module):
             self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln')
         elif args.dif_decoder == 'mamba_tcond_input_adaln_item_consistency_snr':
             self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln')
+        elif args.dif_decoder == 'mamba_tcond_input_adaln_stationary_latent_all':
+            self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln')
+        elif args.dif_decoder == 'mamba_tcond_input_adaln_stationary_latent_snr':
+            self.decoder = AdaLNConditionalMambaDenoiser(args, num_blocks=getattr(args, 'dif_blocks', 2), mode='tcond_input_adaln')
         else:
             self.decoder = TransformerEncoder(args,num_blocks=2,norm_first=False,hidden_size=self.hidden_size)
 
@@ -133,6 +137,8 @@ class DenoisedModel(nn.Module):
             'mamba_tcond_input_adaln_ffn_tsm_adapter_noglobal',
             'mamba_tcond_input_adaln_item_consistency_all',
             'mamba_tcond_input_adaln_item_consistency_snr',
+            'mamba_tcond_input_adaln_stationary_latent_all',
+            'mamba_tcond_input_adaln_stationary_latent_snr',
         }:
             rep_diffu = self.decoder(rep_diffu, rep_item, mask_seq, time_emb, stage_ids=stage_ids)
         elif self.decoder_type in {'mamba_tcond', 'mamba_tcond_ssm', 'mamba_tcond_ffn', 'mamba_tcond_input'}:
@@ -187,6 +193,34 @@ class AdRec(nn.Module):
         self.cfg_scale = args.cfg_scale
         self.geodesic = args.geodesic
         self.ag_encoder = TransformerEncoder(args, num_blocks=2, norm_first=False)
+        self.stationary_latent_mode = {
+            'mamba_tcond_input_adaln_stationary_latent_all': 'all',
+            'mamba_tcond_input_adaln_stationary_latent_snr': 'snr',
+        }.get(args.dif_decoder, 'none')
+        self.stationary_anchor_scale = getattr(args, 'stationary_anchor_scale', 0.25)
+        self.latest_stats = {}
+
+    def build_stationary_target(self, hist_rep, item_tag, mask_seq, mask_tag):
+        if self.stationary_latent_mode == 'none':
+            return item_tag
+        anchor_denom = mask_seq.sum(1, keepdim=True).clamp_min(1.0).unsqueeze(-1)
+        stationary_anchor = (hist_rep * mask_seq.unsqueeze(-1)).sum(1, keepdim=True) / anchor_denom
+        target_latent = (1.0 - self.stationary_anchor_scale) * item_tag + self.stationary_anchor_scale * stationary_anchor
+        target_latent = target_latent * mask_tag.unsqueeze(-1)
+        anchor_norm = stationary_anchor.norm(dim=-1)
+        shift_norm = (target_latent - item_tag).norm(dim=-1)
+        self.latest_stats = {
+            'stationary_latent_mode': self.stationary_latent_mode,
+            'stationary_anchor_scale': float(self.stationary_anchor_scale),
+            'stationary_anchor_norm_mean': float(anchor_norm.mean().detach().item()),
+            'stationary_anchor_norm_std': float(anchor_norm.std(unbiased=False).detach().item()),
+            'stationary_target_shift_norm_mean': float(shift_norm.mean().detach().item()),
+            'stationary_target_shift_norm_std': float(shift_norm.std(unbiased=False).detach().item()),
+        }
+        return target_latent
+
+    def get_latest_stats(self):
+        return dict(self.latest_stats)
 
     def q_sample(self, x_start, t, noise=None, mask=None):
         """
@@ -283,6 +317,7 @@ class AdRec(nn.Module):
 
     def denoise_sample(self, seq, tgt, mask_seq, mask_tag):
         seq = self.ag_encoder(seq, mask_seq)
+        tgt = self.build_stationary_target(seq, tgt, mask_seq, mask_tag)
         # return self.xstart_model(item_rep, noise_x_t, th.tensor([1] * item_rep.shape[0], device=item_rep.device), mask_seq)[0]
         noise_x_t = th.randn_like(tgt)
         indices = list(range(self.num_timesteps))[::-1]
@@ -305,13 +340,14 @@ class AdRec(nn.Module):
         return x_t,t
     def forward(self, item_rep, item_tag, mask_seq,mask_tag):
         item_rep = self.ag_encoder(item_rep, mask_seq)
-        x_t,t = self.independent_diffuse(item_tag, mask_tag, self.independent_diffusion)
+        diff_target = self.build_stationary_target(item_rep, item_tag, mask_seq, mask_tag)
+        x_t,t = self.independent_diffuse(diff_target, mask_tag, self.independent_diffusion)
         if self.cfg_scale != 1:
             mask = torch.rand([mask_seq.shape[0],1,1],device=item_rep.device) > 0.7
             item_rep = torch.where(mask,torch.zeros_like(item_rep),item_rep)
         denoised_seq = self.net(item_rep, x_t, self._scale_timesteps(t), mask_seq,mask_tag)  ##output predict
         # print(denoised_seq.shape,item_tag.shape,mask_tag.shape)
-        losses = F.mse_loss(denoised_seq,item_tag, reduction='none')* (mask_tag / mask_tag.sum(1,keepdim=True)).unsqueeze(-1)
+        losses = F.mse_loss(denoised_seq,diff_target, reduction='none')* (mask_tag / mask_tag.sum(1,keepdim=True)).unsqueeze(-1)
         losses = losses.sum(1).mean()
         return denoised_seq, losses, t
 

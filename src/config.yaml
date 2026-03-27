@@ -42,7 +42,8 @@ epoch_time_avg: false  # Calculate the average time of one epoch training
 # 'mamba_tcond_input_adaln_stage_route_both',
 # 'mamba_tcond_input_adaln_ffn_stage_adapter', 'mamba_tcond_input_adaln_ffn_tsm_adapter',
 # 'mamba_tcond_input_adaln_ffn_tsm_adapter_noglobal',
-# 'mamba_tcond_input_adaln_item_consistency_all', 'mamba_tcond_input_adaln_item_consistency_snr'
+# 'mamba_tcond_input_adaln_item_consistency_all', 'mamba_tcond_input_adaln_item_consistency_snr',
+# 'mamba_tcond_input_adaln_stationary_latent_all', 'mamba_tcond_input_adaln_stationary_latent_snr'
 dif_decoder: att
 mamba_d_state: 16
 mamba_d_conv: 4
@@ -61,6 +62,8 @@ ffn_adapter_bottleneck_ratio: 0.25
 lambda_item: 0.2
 item_consistency_temperature: 0.07
 item_consistency_snr_power: 1.0
+item_consistency_chunk_size: 2048
+stationary_anchor_scale: 0.25
 split_onebyone: false  # Split sequence one by one
 noise_schedule: trunc_lin
 beta_a: 0.3 #beta_schedule

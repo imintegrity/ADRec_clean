@@ -119,6 +119,8 @@ def build_efficiency_report(model_joint, args):
         'lambda_item': getattr(args, 'lambda_item', None),
         'item_consistency_temperature': getattr(args, 'item_consistency_temperature', None),
         'item_consistency_snr_power': getattr(args, 'item_consistency_snr_power', None),
+        'item_consistency_chunk_size': getattr(args, 'item_consistency_chunk_size', None),
+        'stationary_anchor_scale': getattr(args, 'stationary_anchor_scale', None),
         'decoder_mode': getattr(decoder, 'decoder_mode', None),
         'decoder_active_components': getattr(decoder, 'active_components', None),
         'tcond_placement': getattr(getattr(diffu_net, 'decoder', None), 'placement', None),

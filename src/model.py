@@ -34,10 +34,13 @@ class Att_Diffuse_model(nn.Module):
         self.item_consistency_mode = {
             'mamba_tcond_input_adaln_item_consistency_all': 'all',
             'mamba_tcond_input_adaln_item_consistency_snr': 'snr',
+            'mamba_tcond_input_adaln_stationary_latent_all': 'all',
+            'mamba_tcond_input_adaln_stationary_latent_snr': 'snr',
         }.get(args.dif_decoder, 'none')
         self.lambda_item = getattr(args, 'lambda_item', 0.0)
         self.item_consistency_temperature = getattr(args, 'item_consistency_temperature', 0.07)
         self.item_consistency_snr_power = getattr(args, 'item_consistency_snr_power', 1.0)
+        self.item_consistency_chunk_size = getattr(args, 'item_consistency_chunk_size', 2048)
         self.latest_item_consistency_stats = {}
     def load_pretrained_emb_weight(self):
 
@@ -165,11 +168,8 @@ class Att_Diffuse_model(nn.Module):
 
         x0_norm = F.normalize(denoised_seq, dim=-1)
         item_emb_norm = F.normalize(self.item_embedding.weight, dim=-1)
-        item_logits = torch.matmul(x0_norm, item_emb_norm.t()) / self.item_consistency_temperature
-
-        flat_logits = item_logits[valid_mask]
+        flat_x0 = x0_norm[valid_mask]
         flat_labels = labels[valid_mask]
-        ce_per_token = F.cross_entropy(flat_logits, flat_labels, reduction='none')
         flat_timesteps = t[valid_mask].float()
 
         if self.item_consistency_mode == 'snr':
@@ -178,14 +178,37 @@ class Att_Diffuse_model(nn.Module):
         else:
             item_weights = denoised_seq.new_ones(labels.shape, dtype=denoised_seq.dtype)
         flat_weights = item_weights[valid_mask]
-        item_consistency_loss = (ce_per_token * flat_weights).sum() / flat_weights.sum().clamp_min(1e-6)
+        weighted_loss_sum = denoised_seq.new_zeros(())
+        total_weight = flat_weights.sum().clamp_min(1e-6)
+        pos_logits_chunks = []
+        neg_logits_chunks = []
+        top1_acc_sum = denoised_seq.new_zeros(())
+        total_examples = max(flat_labels.numel(), 1)
 
-        pos_logits = flat_logits.gather(-1, flat_labels.unsqueeze(-1)).squeeze(-1)
-        neg_logits_mean = (flat_logits.sum(dim=-1) - pos_logits) / max(flat_logits.shape[-1] - 1, 1)
-        top1_acc = (flat_logits.argmax(dim=-1) == flat_labels).float().mean()
+        chunk_size = max(int(self.item_consistency_chunk_size), 1)
+        for start in range(0, flat_labels.size(0), chunk_size):
+            end = min(start + chunk_size, flat_labels.size(0))
+            chunk_x0 = flat_x0[start:end]
+            chunk_labels = flat_labels[start:end]
+            chunk_weights = flat_weights[start:end]
+            chunk_logits = torch.matmul(chunk_x0, item_emb_norm.t()) / self.item_consistency_temperature
+            chunk_ce = F.cross_entropy(chunk_logits, chunk_labels, reduction='none')
+            weighted_loss_sum = weighted_loss_sum + (chunk_ce * chunk_weights).sum()
+
+            chunk_pos_logits = chunk_logits.gather(-1, chunk_labels.unsqueeze(-1)).squeeze(-1)
+            chunk_neg_logits_mean = (chunk_logits.sum(dim=-1) - chunk_pos_logits) / max(chunk_logits.shape[-1] - 1, 1)
+            pos_logits_chunks.append(chunk_pos_logits.detach())
+            neg_logits_chunks.append(chunk_neg_logits_mean.detach())
+            top1_acc_sum = top1_acc_sum + (chunk_logits.argmax(dim=-1) == chunk_labels).float().sum()
+
+        item_consistency_loss = weighted_loss_sum / total_weight
+        pos_logits = torch.cat(pos_logits_chunks, dim=0) if pos_logits_chunks else denoised_seq.new_zeros(1)
+        neg_logits_mean = torch.cat(neg_logits_chunks, dim=0) if neg_logits_chunks else denoised_seq.new_zeros(1)
+        top1_acc = top1_acc_sum / total_examples
         self.latest_item_consistency_stats = {
             'item_consistency_loss': float(item_consistency_loss.detach().item()),
             'lambda_item': float(self.lambda_item),
+            'item_consistency_chunk_size': int(chunk_size),
             'current_timestep_mean': float(flat_timesteps.mean().detach().item()),
             'current_timestep_std': float(flat_timesteps.std(unbiased=False).detach().item()),
             'item_consistency_weight_mean': float(flat_weights.mean().detach().item()),
@@ -197,7 +220,10 @@ class Att_Diffuse_model(nn.Module):
         return item_consistency_loss
 
     def get_latest_aux_stats(self):
-        return dict(self.latest_item_consistency_stats)
+        merged_stats = dict(self.latest_item_consistency_stats)
+        if hasattr(self.diffu, 'get_latest_stats'):
+            merged_stats.update(self.diffu.get_latest_stats())
+        return merged_stats
     
     def loss_rmse(self, rep_diffu, labels):
         rep_gt = self.item_embedding(labels).squeeze(1)
