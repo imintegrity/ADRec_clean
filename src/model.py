@@ -38,10 +38,18 @@ class Att_Diffuse_model(nn.Module):
             'mamba_tcond_input_adaln_stationary_latent_snr': 'snr',
         }.get(args.dif_decoder, 'none')
         self.lambda_item = getattr(args, 'lambda_item', 0.0)
+        self.item_consistency_max_weight = getattr(args, 'item_consistency_max_weight', self.lambda_item)
+        if self.item_consistency_max_weight is None:
+            self.item_consistency_max_weight = self.lambda_item
+        self.item_consistency_warmup_epochs = getattr(args, 'item_consistency_warmup_epochs', 0)
+        self.item_consistency_ramp_epochs = getattr(args, 'item_consistency_ramp_epochs', 0)
         self.item_consistency_temperature = getattr(args, 'item_consistency_temperature', 0.07)
         self.item_consistency_snr_power = getattr(args, 'item_consistency_snr_power', 1.0)
         self.item_consistency_chunk_size = getattr(args, 'item_consistency_chunk_size', 2048)
+        self.current_epoch = 0
+        self.current_item_consistency_weight = 0.0
         self.latest_item_consistency_stats = {}
+        self.set_curriculum_epoch(0)
     def load_pretrained_emb_weight(self):
 
         path = os.path.join('saved','pretrain',self.args.dataset, 'pretrain.pth')
@@ -136,11 +144,47 @@ class Att_Diffuse_model(nn.Module):
         scores = torch.matmul(item.reshape(-1, item.shape[-1]), self.item_embedding.weight.t())
         return scores
 
+    def _compute_curriculum_weight(self, epoch, max_weight, warmup_epochs, ramp_epochs):
+        max_weight = float(max(max_weight, 0.0))
+        if max_weight == 0.0:
+            return 0.0, 0.0
+        if epoch < warmup_epochs:
+            return 0.0, 0.0
+        if ramp_epochs <= 0:
+            return max_weight, 1.0
+        progress = min(max((epoch - warmup_epochs + 1) / ramp_epochs, 0.0), 1.0)
+        return max_weight * progress, progress
+
+    def set_curriculum_epoch(self, epoch):
+        self.current_epoch = int(epoch)
+        self.current_item_consistency_weight, ramp_progress = self._compute_curriculum_weight(
+            epoch=self.current_epoch,
+            max_weight=self.item_consistency_max_weight,
+            warmup_epochs=self.item_consistency_warmup_epochs,
+            ramp_epochs=self.item_consistency_ramp_epochs,
+        )
+        if hasattr(self.diffu, 'set_curriculum_epoch'):
+            self.diffu.set_curriculum_epoch(self.current_epoch)
+        self.latest_item_consistency_stats.update({
+            'item_consistency_curr_epoch': float(self.current_epoch),
+            'item_consistency_effective_weight': float(self.current_item_consistency_weight),
+            'item_consistency_ramp_progress': float(ramp_progress),
+        })
+
+    def get_current_item_consistency_weight(self):
+        return float(self.current_item_consistency_weight)
+
     def compute_item_consistency_loss(self, denoised_seq, labels, t):
-        if self.item_consistency_mode == 'none' or self.lambda_item <= 0:
+        effective_weight = self.get_current_item_consistency_weight()
+        if self.item_consistency_mode == 'none' or effective_weight <= 0:
             self.latest_item_consistency_stats = {
                 'item_consistency_loss': 0.0,
                 'lambda_item': float(self.lambda_item),
+                'item_consistency_effective_weight': float(effective_weight),
+                'item_consistency_curr_epoch': float(self.current_epoch),
+                'item_consistency_ramp_progress': float(
+                    min(max((self.current_epoch - self.item_consistency_warmup_epochs + 1) / max(self.item_consistency_ramp_epochs, 1), 0.0), 1.0)
+                ) if self.item_consistency_ramp_epochs > 0 and self.current_epoch >= self.item_consistency_warmup_epochs else float(self.current_epoch >= self.item_consistency_warmup_epochs and self.item_consistency_warmup_epochs == 0),
             }
             return denoised_seq.new_zeros(())
 
@@ -149,6 +193,8 @@ class Att_Diffuse_model(nn.Module):
             self.latest_item_consistency_stats = {
                 'item_consistency_loss': 0.0,
                 'lambda_item': float(self.lambda_item),
+                'item_consistency_effective_weight': float(effective_weight),
+                'item_consistency_curr_epoch': float(self.current_epoch),
             }
             return denoised_seq.new_zeros(())
 
@@ -208,6 +254,10 @@ class Att_Diffuse_model(nn.Module):
         self.latest_item_consistency_stats = {
             'item_consistency_loss': float(item_consistency_loss.detach().item()),
             'lambda_item': float(self.lambda_item),
+            'item_consistency_effective_weight': float(effective_weight),
+            'item_consistency_curr_epoch': float(self.current_epoch),
+            'item_consistency_warmup_epochs': float(self.item_consistency_warmup_epochs),
+            'item_consistency_ramp_epochs': float(self.item_consistency_ramp_epochs),
             'item_consistency_chunk_size': int(chunk_size),
             'current_timestep_mean': float(flat_timesteps.mean().detach().item()),
             'current_timestep_std': float(flat_timesteps.std(unbiased=False).detach().item()),

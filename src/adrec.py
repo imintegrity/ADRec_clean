@@ -198,22 +198,67 @@ class AdRec(nn.Module):
             'mamba_tcond_input_adaln_stationary_latent_snr': 'snr',
         }.get(args.dif_decoder, 'none')
         self.stationary_anchor_scale = getattr(args, 'stationary_anchor_scale', 0.25)
+        self.stationary_anchor_max_scale = getattr(args, 'stationary_anchor_max_scale', self.stationary_anchor_scale)
+        if self.stationary_anchor_max_scale is None:
+            self.stationary_anchor_max_scale = self.stationary_anchor_scale
+        self.stationary_shift_norm_cap = getattr(args, 'stationary_shift_norm_cap', 0.0)
+        self.item_consistency_warmup_epochs = getattr(args, 'item_consistency_warmup_epochs', 0)
+        self.item_consistency_ramp_epochs = getattr(args, 'item_consistency_ramp_epochs', 0)
+        self.current_epoch = 0
+        self.current_stationary_anchor_scale = 0.0
         self.latest_stats = {}
+        self.set_curriculum_epoch(0)
+
+    def _compute_curriculum_weight(self, epoch, max_weight, warmup_epochs, ramp_epochs):
+        max_weight = float(max(max_weight, 0.0))
+        if max_weight == 0.0:
+            return 0.0, 0.0
+        if epoch < warmup_epochs:
+            return 0.0, 0.0
+        if ramp_epochs <= 0:
+            return max_weight, 1.0
+        progress = min(max((epoch - warmup_epochs + 1) / ramp_epochs, 0.0), 1.0)
+        return max_weight * progress, progress
+
+    def set_curriculum_epoch(self, epoch):
+        self.current_epoch = int(epoch)
+        self.current_stationary_anchor_scale, ramp_progress = self._compute_curriculum_weight(
+            epoch=self.current_epoch,
+            max_weight=self.stationary_anchor_max_scale,
+            warmup_epochs=self.item_consistency_warmup_epochs,
+            ramp_epochs=self.item_consistency_ramp_epochs,
+        )
+        self.latest_stats.update({
+            'stationary_curr_epoch': float(self.current_epoch),
+            'stationary_effective_anchor_scale': float(self.current_stationary_anchor_scale),
+            'stationary_ramp_progress': float(ramp_progress),
+            'stationary_shift_norm_cap': float(self.stationary_shift_norm_cap),
+        })
 
     def build_stationary_target(self, hist_rep, item_tag, mask_seq, mask_tag):
         if self.stationary_latent_mode == 'none':
             return item_tag
         anchor_denom = mask_seq.sum(1, keepdim=True).clamp_min(1.0).unsqueeze(-1)
         stationary_anchor = (hist_rep * mask_seq.unsqueeze(-1)).sum(1, keepdim=True) / anchor_denom
-        target_latent = (1.0 - self.stationary_anchor_scale) * item_tag + self.stationary_anchor_scale * stationary_anchor
+        anchor_shift = stationary_anchor - item_tag
+        raw_shift_norm = anchor_shift.norm(dim=-1)
+        if self.stationary_shift_norm_cap and self.stationary_shift_norm_cap > 0:
+            capped_shift_norm = raw_shift_norm.clamp(max=self.stationary_shift_norm_cap)
+            anchor_shift = anchor_shift * (capped_shift_norm / raw_shift_norm.clamp_min(1e-6)).unsqueeze(-1)
+        target_latent = item_tag + self.current_stationary_anchor_scale * anchor_shift
         target_latent = target_latent * mask_tag.unsqueeze(-1)
         anchor_norm = stationary_anchor.norm(dim=-1)
         shift_norm = (target_latent - item_tag).norm(dim=-1)
         self.latest_stats = {
             'stationary_latent_mode': self.stationary_latent_mode,
             'stationary_anchor_scale': float(self.stationary_anchor_scale),
+            'stationary_anchor_max_scale': float(self.stationary_anchor_max_scale),
+            'stationary_effective_anchor_scale': float(self.current_stationary_anchor_scale),
+            'stationary_shift_norm_cap': float(self.stationary_shift_norm_cap),
             'stationary_anchor_norm_mean': float(anchor_norm.mean().detach().item()),
             'stationary_anchor_norm_std': float(anchor_norm.std(unbiased=False).detach().item()),
+            'stationary_raw_shift_norm_mean': float(raw_shift_norm.mean().detach().item()),
+            'stationary_raw_shift_norm_std': float(raw_shift_norm.std(unbiased=False).detach().item()),
             'stationary_target_shift_norm_mean': float(shift_norm.mean().detach().item()),
             'stationary_target_shift_norm_std': float(shift_norm.std(unbiased=False).detach().item()),
         }

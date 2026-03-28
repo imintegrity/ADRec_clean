@@ -120,7 +120,12 @@ def build_efficiency_report(model_joint, args):
         'item_consistency_temperature': getattr(args, 'item_consistency_temperature', None),
         'item_consistency_snr_power': getattr(args, 'item_consistency_snr_power', None),
         'item_consistency_chunk_size': getattr(args, 'item_consistency_chunk_size', None),
+        'item_consistency_warmup_epochs': getattr(args, 'item_consistency_warmup_epochs', None),
+        'item_consistency_ramp_epochs': getattr(args, 'item_consistency_ramp_epochs', None),
+        'item_consistency_max_weight': getattr(args, 'item_consistency_max_weight', None),
         'stationary_anchor_scale': getattr(args, 'stationary_anchor_scale', None),
+        'stationary_anchor_max_scale': getattr(args, 'stationary_anchor_max_scale', None),
+        'stationary_shift_norm_cap': getattr(args, 'stationary_shift_norm_cap', None),
         'decoder_mode': getattr(decoder, 'decoder_mode', None),
         'decoder_active_components': getattr(decoder, 'active_components', None),
         'tcond_placement': getattr(getattr(diffu_net, 'decoder', None), 'placement', None),
@@ -179,6 +184,8 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
     train_wall_clock_start = time.perf_counter()
     for epoch_temp in range(epochs):
         model_joint.train()
+        if hasattr(model_joint, 'set_curriculum_epoch'):
+            model_joint.set_curriculum_epoch(epoch_temp)
         if (
             args.model == 'adrec'
             and args.embedding_warmup_epochs > 0
@@ -209,9 +216,10 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             item_consistency_loss = outputs[3] if len(outputs) > 3 and outputs[3] is not None else torch.zeros(1, device=args.device)
             ce_loss = model_joint.calculate_loss(out_seq, train_batch[1])  ## use this not above
             if args.model=='adrec' and args.loss=='mse':
+                current_item_weight = getattr(model_joint, 'get_current_item_consistency_weight', lambda: getattr(args, 'lambda_item', 0.0))()
                 candidate_losses = [ce_loss, args.loss_scale * dif_loss]
-                if getattr(args, 'lambda_item', 0.0) > 0:
-                    candidate_losses.append(args.lambda_item * item_consistency_loss)
+                if current_item_weight > 0:
+                    candidate_losses.append(current_item_weight * item_consistency_loss)
                 losses = [loss for loss in candidate_losses if loss_requires_grad(loss)]
                 if not losses:
                     losses = [ce_loss]
