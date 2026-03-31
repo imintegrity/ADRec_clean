@@ -50,11 +50,15 @@ class Att_Diffuse_model(nn.Module):
             getattr(args, 'item_consistency_temperature', 0.07),
         )
         self.item_alignment_margin = getattr(args, 'item_alignment_margin', 0.10)
+        self.item_alignment_num_negatives = getattr(args, 'item_alignment_num_negatives', 32)
+        self.item_alignment_negative_source = getattr(args, 'item_alignment_negative_source', 'inbatch_then_random')
         self.item_consistency_temperature = getattr(args, 'item_consistency_temperature', self.item_alignment_temperature)
         self.item_consistency_snr_power = getattr(args, 'item_consistency_snr_power', 1.0)
         self.item_consistency_chunk_size = getattr(args, 'item_consistency_chunk_size', 2048)
-        if self.item_alignment_mode not in {'ce', 'cosine_margin_ce'}:
+        if self.item_alignment_mode not in {'ce', 'pref_ratio', 'cosine_margin_ce'}:
             raise ValueError(f"unsupported item_alignment_mode: {self.item_alignment_mode}")
+        if self.item_alignment_negative_source not in {'inbatch', 'random', 'inbatch_then_random'}:
+            raise ValueError(f"unsupported item_alignment_negative_source: {self.item_alignment_negative_source}")
         self.current_epoch = 0
         self.current_item_consistency_weight = 0.0
         self.latest_item_consistency_stats = {}
@@ -183,6 +187,73 @@ class Att_Diffuse_model(nn.Module):
     def get_current_item_consistency_weight(self):
         return float(self.current_item_consistency_weight)
 
+    def _sample_random_negatives(self, positive_labels, num_negatives):
+        if num_negatives <= 0:
+            return positive_labels.new_empty((positive_labels.size(0), 0))
+        neg_ids = torch.randint(
+            1,
+            self.item_num + 1,
+            (positive_labels.size(0), num_negatives),
+            device=positive_labels.device,
+            dtype=positive_labels.dtype,
+        )
+        if self.item_num <= 1:
+            return neg_ids.fill_(0)
+        conflict_mask = neg_ids.eq(positive_labels.unsqueeze(1))
+        max_resample_rounds = 8
+        for _ in range(max_resample_rounds):
+            if not conflict_mask.any():
+                break
+            neg_ids[conflict_mask] = torch.randint(
+                1,
+                self.item_num + 1,
+                (int(conflict_mask.sum().item()),),
+                device=positive_labels.device,
+                dtype=positive_labels.dtype,
+            )
+            conflict_mask = neg_ids.eq(positive_labels.unsqueeze(1))
+        if conflict_mask.any():
+            neg_ids[conflict_mask] = ((positive_labels.unsqueeze(1).expand_as(neg_ids)[conflict_mask]) % self.item_num) + 1
+        return neg_ids
+
+    def _sample_pref_ratio_negatives(self, positive_labels, num_negatives):
+        num_negatives = max(int(num_negatives), 0)
+        if num_negatives == 0:
+            return positive_labels.new_empty((positive_labels.size(0), 0))
+
+        negative_ids = positive_labels.new_empty((positive_labels.size(0), num_negatives))
+        filled_counts = torch.zeros(positive_labels.size(0), device=positive_labels.device, dtype=torch.long)
+        unique_labels = torch.unique(positive_labels.detach())
+        use_inbatch = self.item_alignment_negative_source in {'inbatch', 'inbatch_then_random'}
+
+        if use_inbatch and unique_labels.numel() > 1:
+            for idx in range(positive_labels.size(0)):
+                candidate_ids = unique_labels[unique_labels != positive_labels[idx]]
+                if candidate_ids.numel() == 0:
+                    continue
+                take_num = min(num_negatives, candidate_ids.numel())
+                perm = torch.randperm(candidate_ids.numel(), device=positive_labels.device)[:take_num]
+                sampled_ids = candidate_ids[perm]
+                negative_ids[idx, :take_num] = sampled_ids
+                filled_counts[idx] = take_num
+
+        if self.item_alignment_negative_source in {'random', 'inbatch_then_random'}:
+            need_random = filled_counts < num_negatives
+            if need_random.any():
+                random_neg_ids = self._sample_random_negatives(positive_labels[need_random], num_negatives)
+                for row_idx, sample_idx in enumerate(torch.nonzero(need_random, as_tuple=False).flatten()):
+                    start_idx = int(filled_counts[sample_idx].item())
+                    negative_ids[sample_idx, start_idx:] = random_neg_ids[row_idx, :(num_negatives - start_idx)]
+
+        if self.item_alignment_negative_source == 'inbatch' and (filled_counts < num_negatives).any():
+            need_fill = filled_counts < num_negatives
+            fallback_neg_ids = self._sample_random_negatives(positive_labels[need_fill], num_negatives)
+            for row_idx, sample_idx in enumerate(torch.nonzero(need_fill, as_tuple=False).flatten()):
+                start_idx = int(filled_counts[sample_idx].item())
+                negative_ids[sample_idx, start_idx:] = fallback_neg_ids[row_idx, :(num_negatives - start_idx)]
+
+        return negative_ids
+
     def compute_item_consistency_loss(self, denoised_seq, labels, t):
         effective_weight = self.get_current_item_consistency_weight()
         if self.item_consistency_mode == 'none' or effective_weight <= 0:
@@ -194,6 +265,13 @@ class Att_Diffuse_model(nn.Module):
                 'item_alignment_mode': self.item_alignment_mode,
                 'item_alignment_temperature': float(self.item_alignment_temperature),
                 'item_alignment_margin': float(self.item_alignment_margin),
+                'item_alignment_num_negatives': int(self.item_alignment_num_negatives),
+                'item_alignment_negative_source': self.item_alignment_negative_source,
+                'pref_ratio_loss': 0.0,
+                'pos_score_mean': 0.0,
+                'neg_score_mean': 0.0,
+                'pos_minus_neg_gap_mean': 0.0,
+                'x0_item_top1_acc': 0.0,
                 'item_consistency_ramp_progress': float(
                     min(max((self.current_epoch - self.item_consistency_warmup_epochs + 1) / max(self.item_consistency_ramp_epochs, 1), 0.0), 1.0)
                 ) if self.item_consistency_ramp_epochs > 0 and self.current_epoch >= self.item_consistency_warmup_epochs else float(self.current_epoch >= self.item_consistency_warmup_epochs and self.item_consistency_warmup_epochs == 0),
@@ -210,6 +288,13 @@ class Att_Diffuse_model(nn.Module):
                 'item_alignment_mode': self.item_alignment_mode,
                 'item_alignment_temperature': float(self.item_alignment_temperature),
                 'item_alignment_margin': float(self.item_alignment_margin),
+                'item_alignment_num_negatives': int(self.item_alignment_num_negatives),
+                'item_alignment_negative_source': self.item_alignment_negative_source,
+                'pref_ratio_loss': 0.0,
+                'pos_score_mean': 0.0,
+                'neg_score_mean': 0.0,
+                'pos_minus_neg_gap_mean': 0.0,
+                'x0_item_top1_acc': 0.0,
             }
             return denoised_seq.new_zeros(())
 
@@ -243,6 +328,7 @@ class Att_Diffuse_model(nn.Module):
         total_weight = flat_weights.sum().clamp_min(1e-6)
         pos_logits_chunks = []
         neg_logits_chunks = []
+        gap_chunks = []
         top1_acc_sum = denoised_seq.new_zeros(())
         total_examples = max(flat_labels.numel(), 1)
 
@@ -252,23 +338,40 @@ class Att_Diffuse_model(nn.Module):
             chunk_x0 = flat_x0[start:end]
             chunk_labels = flat_labels[start:end]
             chunk_weights = flat_weights[start:end]
-            chunk_logits = torch.matmul(chunk_x0, item_emb_norm.t())
-            chunk_logits = chunk_logits / self.item_alignment_temperature
-            if self.item_alignment_mode == 'cosine_margin_ce':
-                margin_mask = F.one_hot(chunk_labels, num_classes=chunk_logits.size(-1)).to(chunk_logits.dtype)
-                chunk_logits = chunk_logits - margin_mask * self.item_alignment_margin
-            chunk_ce = F.cross_entropy(chunk_logits, chunk_labels, reduction='none')
-            weighted_loss_sum = weighted_loss_sum + (chunk_ce * chunk_weights).sum()
+            if self.item_alignment_mode == 'pref_ratio':
+                neg_ids = self._sample_pref_ratio_negatives(chunk_labels, self.item_alignment_num_negatives)
+                pos_scores = (chunk_x0 * item_emb_norm[chunk_labels]).sum(dim=-1, keepdim=True)
+                if neg_ids.numel() > 0:
+                    neg_emb = item_emb_norm[neg_ids]
+                    neg_scores = (chunk_x0.unsqueeze(1) * neg_emb).sum(dim=-1)
+                    sampled_logits = torch.cat([pos_scores, neg_scores], dim=-1) / self.item_alignment_temperature
+                else:
+                    neg_scores = chunk_x0.new_zeros((chunk_x0.size(0), 0))
+                    sampled_logits = pos_scores / self.item_alignment_temperature
+                chunk_loss = -F.log_softmax(sampled_logits, dim=-1)[:, 0]
+                chunk_pos_logits = sampled_logits[:, 0]
+                chunk_neg_logits_mean = neg_scores.mean(dim=-1) / self.item_alignment_temperature if neg_scores.numel() > 0 else chunk_pos_logits.new_zeros(chunk_pos_logits.shape)
+                top1_acc_sum = top1_acc_sum + (sampled_logits.argmax(dim=-1) == 0).float().sum()
+            else:
+                chunk_logits = torch.matmul(chunk_x0, item_emb_norm.t())
+                chunk_logits = chunk_logits / self.item_alignment_temperature
+                if self.item_alignment_mode == 'cosine_margin_ce':
+                    margin_mask = F.one_hot(chunk_labels, num_classes=chunk_logits.size(-1)).to(chunk_logits.dtype)
+                    chunk_logits = chunk_logits - margin_mask * self.item_alignment_margin
+                chunk_loss = F.cross_entropy(chunk_logits, chunk_labels, reduction='none')
+                chunk_pos_logits = chunk_logits.gather(-1, chunk_labels.unsqueeze(-1)).squeeze(-1)
+                chunk_neg_logits_mean = (chunk_logits.sum(dim=-1) - chunk_pos_logits) / max(chunk_logits.shape[-1] - 1, 1)
+                top1_acc_sum = top1_acc_sum + (chunk_logits.argmax(dim=-1) == chunk_labels).float().sum()
 
-            chunk_pos_logits = chunk_logits.gather(-1, chunk_labels.unsqueeze(-1)).squeeze(-1)
-            chunk_neg_logits_mean = (chunk_logits.sum(dim=-1) - chunk_pos_logits) / max(chunk_logits.shape[-1] - 1, 1)
+            weighted_loss_sum = weighted_loss_sum + (chunk_loss * chunk_weights).sum()
             pos_logits_chunks.append(chunk_pos_logits.detach())
             neg_logits_chunks.append(chunk_neg_logits_mean.detach())
-            top1_acc_sum = top1_acc_sum + (chunk_logits.argmax(dim=-1) == chunk_labels).float().sum()
+            gap_chunks.append((chunk_pos_logits - chunk_neg_logits_mean).detach())
 
         item_consistency_loss = weighted_loss_sum / total_weight
         pos_logits = torch.cat(pos_logits_chunks, dim=0) if pos_logits_chunks else denoised_seq.new_zeros(1)
         neg_logits_mean = torch.cat(neg_logits_chunks, dim=0) if neg_logits_chunks else denoised_seq.new_zeros(1)
+        pos_minus_neg_gap = torch.cat(gap_chunks, dim=0) if gap_chunks else denoised_seq.new_zeros(1)
         top1_acc = top1_acc_sum / total_examples
         self.latest_item_consistency_stats = {
             'item_consistency_loss': float(item_consistency_loss.detach().item()),
@@ -281,12 +384,18 @@ class Att_Diffuse_model(nn.Module):
             'item_alignment_mode': self.item_alignment_mode,
             'item_alignment_temperature': float(self.item_alignment_temperature),
             'item_alignment_margin': float(self.item_alignment_margin),
+            'item_alignment_num_negatives': int(self.item_alignment_num_negatives),
+            'item_alignment_negative_source': self.item_alignment_negative_source,
             'current_timestep_mean': float(flat_timesteps.mean().detach().item()),
             'current_timestep_std': float(flat_timesteps.std(unbiased=False).detach().item()),
             'item_consistency_weight_mean': float(flat_weights.mean().detach().item()),
             'item_consistency_weight_std': float(flat_weights.std(unbiased=False).detach().item()),
             'x0_item_pos_logit_mean': float(pos_logits.mean().detach().item()),
             'x0_item_neg_logit_mean': float(neg_logits_mean.mean().detach().item()),
+            'pref_ratio_loss': float(item_consistency_loss.detach().item()) if self.item_alignment_mode == 'pref_ratio' else 0.0,
+            'pos_score_mean': float(pos_logits.mean().detach().item()),
+            'neg_score_mean': float(neg_logits_mean.mean().detach().item()),
+            'pos_minus_neg_gap_mean': float(pos_minus_neg_gap.mean().detach().item()),
             'x0_item_top1_acc': float(top1_acc.detach().item()),
         }
         return item_consistency_loss

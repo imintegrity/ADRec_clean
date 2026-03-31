@@ -120,6 +120,8 @@ def build_efficiency_report(model_joint, args):
         'item_alignment_mode': getattr(args, 'item_alignment_mode', None),
         'item_alignment_temperature': getattr(args, 'item_alignment_temperature', None),
         'item_alignment_margin': getattr(args, 'item_alignment_margin', None),
+        'item_alignment_num_negatives': getattr(args, 'item_alignment_num_negatives', None),
+        'item_alignment_negative_source': getattr(args, 'item_alignment_negative_source', None),
         'item_consistency_temperature': getattr(args, 'item_consistency_temperature', None),
         'item_consistency_snr_power': getattr(args, 'item_consistency_snr_power', None),
         'item_consistency_chunk_size': getattr(args, 'item_consistency_chunk_size', None),
@@ -201,6 +203,7 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
         dif_losses = []
         item_losses = []
         epoch_tcond_stats = {}
+        epoch_tcond_meta = {}
         flag_update = 0
         epoch_samples = 0
         if is_cuda_device(device):
@@ -240,6 +243,8 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             for key, value in current_tcond_stats.items():
                 if is_numeric_stat(value):
                     epoch_tcond_stats.setdefault(key, []).append(value)
+                elif isinstance(value, str):
+                    epoch_tcond_meta[key] = value
             optimizer.step()
             pbr_train.set_postfix_str(f'loss={ce_losses[-1]:.3f}')
             # if index_temp % int(len(tra_data_loader) / 5 + 1) == 0:
@@ -274,6 +279,7 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             epoch_tcond_summary = {
                 key: float(np.mean(values)) for key, values in epoch_tcond_stats.items()
             }
+            epoch_tcond_summary.update(epoch_tcond_meta)
             logger.info(f"epoch {epoch_temp} tcond gate stats: {epoch_tcond_summary}")
             epoch_efficiency_entry.update(epoch_tcond_summary)
         efficiency_report['epoch_efficiency'].append(epoch_efficiency_entry)
