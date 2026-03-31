@@ -43,9 +43,18 @@ class Att_Diffuse_model(nn.Module):
             self.item_consistency_max_weight = self.lambda_item
         self.item_consistency_warmup_epochs = getattr(args, 'item_consistency_warmup_epochs', 0)
         self.item_consistency_ramp_epochs = getattr(args, 'item_consistency_ramp_epochs', 0)
-        self.item_consistency_temperature = getattr(args, 'item_consistency_temperature', 0.07)
+        self.item_alignment_mode = getattr(args, 'item_alignment_mode', 'ce')
+        self.item_alignment_temperature = getattr(
+            args,
+            'item_alignment_temperature',
+            getattr(args, 'item_consistency_temperature', 0.07),
+        )
+        self.item_alignment_margin = getattr(args, 'item_alignment_margin', 0.10)
+        self.item_consistency_temperature = getattr(args, 'item_consistency_temperature', self.item_alignment_temperature)
         self.item_consistency_snr_power = getattr(args, 'item_consistency_snr_power', 1.0)
         self.item_consistency_chunk_size = getattr(args, 'item_consistency_chunk_size', 2048)
+        if self.item_alignment_mode not in {'ce', 'cosine_margin_ce'}:
+            raise ValueError(f"unsupported item_alignment_mode: {self.item_alignment_mode}")
         self.current_epoch = 0
         self.current_item_consistency_weight = 0.0
         self.latest_item_consistency_stats = {}
@@ -182,6 +191,9 @@ class Att_Diffuse_model(nn.Module):
                 'lambda_item': float(self.lambda_item),
                 'item_consistency_effective_weight': float(effective_weight),
                 'item_consistency_curr_epoch': float(self.current_epoch),
+                'item_alignment_mode': self.item_alignment_mode,
+                'item_alignment_temperature': float(self.item_alignment_temperature),
+                'item_alignment_margin': float(self.item_alignment_margin),
                 'item_consistency_ramp_progress': float(
                     min(max((self.current_epoch - self.item_consistency_warmup_epochs + 1) / max(self.item_consistency_ramp_epochs, 1), 0.0), 1.0)
                 ) if self.item_consistency_ramp_epochs > 0 and self.current_epoch >= self.item_consistency_warmup_epochs else float(self.current_epoch >= self.item_consistency_warmup_epochs and self.item_consistency_warmup_epochs == 0),
@@ -195,6 +207,9 @@ class Att_Diffuse_model(nn.Module):
                 'lambda_item': float(self.lambda_item),
                 'item_consistency_effective_weight': float(effective_weight),
                 'item_consistency_curr_epoch': float(self.current_epoch),
+                'item_alignment_mode': self.item_alignment_mode,
+                'item_alignment_temperature': float(self.item_alignment_temperature),
+                'item_alignment_margin': float(self.item_alignment_margin),
             }
             return denoised_seq.new_zeros(())
 
@@ -237,7 +252,11 @@ class Att_Diffuse_model(nn.Module):
             chunk_x0 = flat_x0[start:end]
             chunk_labels = flat_labels[start:end]
             chunk_weights = flat_weights[start:end]
-            chunk_logits = torch.matmul(chunk_x0, item_emb_norm.t()) / self.item_consistency_temperature
+            chunk_logits = torch.matmul(chunk_x0, item_emb_norm.t())
+            chunk_logits = chunk_logits / self.item_alignment_temperature
+            if self.item_alignment_mode == 'cosine_margin_ce':
+                margin_mask = F.one_hot(chunk_labels, num_classes=chunk_logits.size(-1)).to(chunk_logits.dtype)
+                chunk_logits = chunk_logits - margin_mask * self.item_alignment_margin
             chunk_ce = F.cross_entropy(chunk_logits, chunk_labels, reduction='none')
             weighted_loss_sum = weighted_loss_sum + (chunk_ce * chunk_weights).sum()
 
@@ -259,6 +278,9 @@ class Att_Diffuse_model(nn.Module):
             'item_consistency_warmup_epochs': float(self.item_consistency_warmup_epochs),
             'item_consistency_ramp_epochs': float(self.item_consistency_ramp_epochs),
             'item_consistency_chunk_size': int(chunk_size),
+            'item_alignment_mode': self.item_alignment_mode,
+            'item_alignment_temperature': float(self.item_alignment_temperature),
+            'item_alignment_margin': float(self.item_alignment_margin),
             'current_timestep_mean': float(flat_timesteps.mean().detach().item()),
             'current_timestep_std': float(flat_timesteps.std(unbiased=False).detach().item()),
             'item_consistency_weight_mean': float(flat_weights.mean().detach().item()),
