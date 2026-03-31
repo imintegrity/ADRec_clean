@@ -60,8 +60,11 @@ ffn_adapter_num_stages: 4
 ffn_adapter_ctx_num_stages: 2
 ffn_adapter_bottleneck_ratio: 0.25
 lambda_item: 0.2
-item_alignment_mode: pref_ratio
+item_alignment_mode: topk_kd
 item_alignment_temperature: 0.07
+item_alignment_topk: 50
+item_alignment_kd_temperature: 1.0
+item_alignment_teacher_source: main_ce_head
 item_alignment_margin: 0.10
 item_alignment_num_negatives: 32
 item_alignment_negative_source: inbatch_then_random

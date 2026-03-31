@@ -49,14 +49,19 @@ class Att_Diffuse_model(nn.Module):
             'item_alignment_temperature',
             getattr(args, 'item_consistency_temperature', 0.07),
         )
+        self.item_alignment_topk = getattr(args, 'item_alignment_topk', 50)
+        self.item_alignment_kd_temperature = getattr(args, 'item_alignment_kd_temperature', 1.0)
+        self.item_alignment_teacher_source = getattr(args, 'item_alignment_teacher_source', 'main_ce_head')
         self.item_alignment_margin = getattr(args, 'item_alignment_margin', 0.10)
         self.item_alignment_num_negatives = getattr(args, 'item_alignment_num_negatives', 32)
         self.item_alignment_negative_source = getattr(args, 'item_alignment_negative_source', 'inbatch_then_random')
         self.item_consistency_temperature = getattr(args, 'item_consistency_temperature', self.item_alignment_temperature)
         self.item_consistency_snr_power = getattr(args, 'item_consistency_snr_power', 1.0)
         self.item_consistency_chunk_size = getattr(args, 'item_consistency_chunk_size', 2048)
-        if self.item_alignment_mode not in {'ce', 'pref_ratio', 'cosine_margin_ce'}:
+        if self.item_alignment_mode not in {'ce', 'topk_kd', 'pref_ratio', 'cosine_margin_ce'}:
             raise ValueError(f"unsupported item_alignment_mode: {self.item_alignment_mode}")
+        if self.item_alignment_teacher_source not in {'main_ce_head'}:
+            raise ValueError(f"unsupported item_alignment_teacher_source: {self.item_alignment_teacher_source}")
         if self.item_alignment_negative_source not in {'inbatch', 'random', 'inbatch_then_random'}:
             raise ValueError(f"unsupported item_alignment_negative_source: {self.item_alignment_negative_source}")
         self.current_epoch = 0
@@ -254,6 +259,28 @@ class Att_Diffuse_model(nn.Module):
 
         return negative_ids
 
+    def _build_teacher_topk_candidates(self, teacher_logits, target_labels, topk):
+        topk = max(int(topk), 1)
+        teacher_logits = teacher_logits.clone()
+        if teacher_logits.size(-1) > 0:
+            teacher_logits[:, 0] = float('-inf')
+        k = min(topk, teacher_logits.size(-1) - 1 if teacher_logits.size(-1) > 1 else 1)
+        topk_logits, topk_indices = torch.topk(teacher_logits, k=k, dim=-1)
+
+        target_in_topk = topk_indices.eq(target_labels.unsqueeze(-1))
+        missing_mask = ~target_in_topk.any(dim=-1)
+        if missing_mask.any():
+            topk_indices[missing_mask, -1] = target_labels[missing_mask]
+            topk_logits[missing_mask, -1] = teacher_logits[missing_mask, target_labels[missing_mask]]
+
+        candidate_teacher_logits = teacher_logits.gather(-1, topk_indices)
+        sorted_teacher_logits, sorted_order = torch.sort(candidate_teacher_logits, dim=-1, descending=True)
+        sorted_indices = topk_indices.gather(-1, sorted_order)
+        target_rank = sorted_indices.eq(target_labels.unsqueeze(-1)).float().argmax(dim=-1) + 1
+        teacher_probs = F.softmax(sorted_teacher_logits / self.item_alignment_kd_temperature, dim=-1)
+        teacher_entropy = -(teacher_probs * torch.log(teacher_probs.clamp_min(1e-12))).sum(dim=-1)
+        return sorted_indices, sorted_teacher_logits, teacher_entropy, target_rank
+
     def compute_item_consistency_loss(self, denoised_seq, labels, t):
         effective_weight = self.get_current_item_consistency_weight()
         if self.item_consistency_mode == 'none' or effective_weight <= 0:
@@ -264,10 +291,18 @@ class Att_Diffuse_model(nn.Module):
                 'item_consistency_curr_epoch': float(self.current_epoch),
                 'item_alignment_mode': self.item_alignment_mode,
                 'item_alignment_temperature': float(self.item_alignment_temperature),
+                'item_alignment_topk': int(self.item_alignment_topk),
+                'item_alignment_kd_temperature': float(self.item_alignment_kd_temperature),
+                'item_alignment_teacher_source': self.item_alignment_teacher_source,
                 'item_alignment_margin': float(self.item_alignment_margin),
                 'item_alignment_num_negatives': int(self.item_alignment_num_negatives),
                 'item_alignment_negative_source': self.item_alignment_negative_source,
                 'pref_ratio_loss': 0.0,
+                'kd_loss': 0.0,
+                'teacher_topk_entropy': 0.0,
+                'teacher_target_rank_in_topk': 0.0,
+                'teacher_topk_logit_mean': 0.0,
+                'student_topk_logit_mean': 0.0,
                 'pos_score_mean': 0.0,
                 'neg_score_mean': 0.0,
                 'pos_minus_neg_gap_mean': 0.0,
@@ -287,10 +322,18 @@ class Att_Diffuse_model(nn.Module):
                 'item_consistency_curr_epoch': float(self.current_epoch),
                 'item_alignment_mode': self.item_alignment_mode,
                 'item_alignment_temperature': float(self.item_alignment_temperature),
+                'item_alignment_topk': int(self.item_alignment_topk),
+                'item_alignment_kd_temperature': float(self.item_alignment_kd_temperature),
+                'item_alignment_teacher_source': self.item_alignment_teacher_source,
                 'item_alignment_margin': float(self.item_alignment_margin),
                 'item_alignment_num_negatives': int(self.item_alignment_num_negatives),
                 'item_alignment_negative_source': self.item_alignment_negative_source,
                 'pref_ratio_loss': 0.0,
+                'kd_loss': 0.0,
+                'teacher_topk_entropy': 0.0,
+                'teacher_target_rank_in_topk': 0.0,
+                'teacher_topk_logit_mean': 0.0,
+                'student_topk_logit_mean': 0.0,
                 'pos_score_mean': 0.0,
                 'neg_score_mean': 0.0,
                 'pos_minus_neg_gap_mean': 0.0,
@@ -312,6 +355,7 @@ class Att_Diffuse_model(nn.Module):
             raise ValueError(f"unexpected timestep shape {tuple(t.shape)} for labels shape {tuple(labels.shape)}")
         t = t.long().clamp(min=0, max=self.diffu.num_timesteps - 1)
 
+        flat_teacher_state = denoised_seq[valid_mask]
         x0_norm = F.normalize(denoised_seq, dim=-1)
         item_emb_norm = F.normalize(self.item_embedding.weight, dim=-1)
         flat_x0 = x0_norm[valid_mask]
@@ -329,6 +373,10 @@ class Att_Diffuse_model(nn.Module):
         pos_logits_chunks = []
         neg_logits_chunks = []
         gap_chunks = []
+        teacher_entropy_chunks = []
+        teacher_rank_chunks = []
+        teacher_topk_logit_chunks = []
+        student_topk_logit_chunks = []
         top1_acc_sum = denoised_seq.new_zeros(())
         total_examples = max(flat_labels.numel(), 1)
 
@@ -336,9 +384,31 @@ class Att_Diffuse_model(nn.Module):
         for start in range(0, flat_labels.size(0), chunk_size):
             end = min(start + chunk_size, flat_labels.size(0))
             chunk_x0 = flat_x0[start:end]
+            chunk_teacher_state = flat_teacher_state[start:end]
             chunk_labels = flat_labels[start:end]
             chunk_weights = flat_weights[start:end]
-            if self.item_alignment_mode == 'pref_ratio':
+            if self.item_alignment_mode == 'topk_kd':
+                teacher_logits = torch.matmul(chunk_teacher_state.detach(), self.item_embedding.weight.detach().t())
+                candidate_ids, teacher_topk_logits, teacher_entropy, teacher_target_rank = self._build_teacher_topk_candidates(
+                    teacher_logits=teacher_logits,
+                    target_labels=chunk_labels,
+                    topk=self.item_alignment_topk,
+                )
+                candidate_emb = item_emb_norm[candidate_ids]
+                student_topk_logits = (chunk_x0.unsqueeze(1) * candidate_emb).sum(dim=-1) / self.item_alignment_temperature
+                teacher_probs = F.softmax(teacher_topk_logits / self.item_alignment_kd_temperature, dim=-1)
+                student_log_probs = F.log_softmax(student_topk_logits / self.item_alignment_kd_temperature, dim=-1)
+                chunk_loss = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)
+                chunk_loss = chunk_loss * (self.item_alignment_kd_temperature ** 2)
+                target_positions = candidate_ids.eq(chunk_labels.unsqueeze(-1)).float().argmax(dim=-1)
+                chunk_pos_logits = student_topk_logits.gather(-1, target_positions.unsqueeze(-1)).squeeze(-1)
+                chunk_neg_logits_mean = (student_topk_logits.sum(dim=-1) - chunk_pos_logits) / max(student_topk_logits.shape[-1] - 1, 1)
+                top1_acc_sum = top1_acc_sum + (candidate_ids.gather(-1, student_topk_logits.argmax(dim=-1, keepdim=True)).squeeze(-1) == chunk_labels).float().sum()
+                teacher_entropy_chunks.append(teacher_entropy.detach())
+                teacher_rank_chunks.append(teacher_target_rank.detach().float())
+                teacher_topk_logit_chunks.append(teacher_topk_logits.mean(dim=-1).detach())
+                student_topk_logit_chunks.append(student_topk_logits.mean(dim=-1).detach())
+            elif self.item_alignment_mode == 'pref_ratio':
                 neg_ids = self._sample_pref_ratio_negatives(chunk_labels, self.item_alignment_num_negatives)
                 pos_scores = (chunk_x0 * item_emb_norm[chunk_labels]).sum(dim=-1, keepdim=True)
                 if neg_ids.numel() > 0:
@@ -372,6 +442,10 @@ class Att_Diffuse_model(nn.Module):
         pos_logits = torch.cat(pos_logits_chunks, dim=0) if pos_logits_chunks else denoised_seq.new_zeros(1)
         neg_logits_mean = torch.cat(neg_logits_chunks, dim=0) if neg_logits_chunks else denoised_seq.new_zeros(1)
         pos_minus_neg_gap = torch.cat(gap_chunks, dim=0) if gap_chunks else denoised_seq.new_zeros(1)
+        teacher_topk_entropy = torch.cat(teacher_entropy_chunks, dim=0) if teacher_entropy_chunks else denoised_seq.new_zeros(1)
+        teacher_target_rank = torch.cat(teacher_rank_chunks, dim=0) if teacher_rank_chunks else denoised_seq.new_zeros(1)
+        teacher_topk_logit_mean = torch.cat(teacher_topk_logit_chunks, dim=0) if teacher_topk_logit_chunks else denoised_seq.new_zeros(1)
+        student_topk_logit_mean = torch.cat(student_topk_logit_chunks, dim=0) if student_topk_logit_chunks else denoised_seq.new_zeros(1)
         top1_acc = top1_acc_sum / total_examples
         self.latest_item_consistency_stats = {
             'item_consistency_loss': float(item_consistency_loss.detach().item()),
@@ -383,6 +457,9 @@ class Att_Diffuse_model(nn.Module):
             'item_consistency_chunk_size': int(chunk_size),
             'item_alignment_mode': self.item_alignment_mode,
             'item_alignment_temperature': float(self.item_alignment_temperature),
+            'item_alignment_topk': int(self.item_alignment_topk),
+            'item_alignment_kd_temperature': float(self.item_alignment_kd_temperature),
+            'item_alignment_teacher_source': self.item_alignment_teacher_source,
             'item_alignment_margin': float(self.item_alignment_margin),
             'item_alignment_num_negatives': int(self.item_alignment_num_negatives),
             'item_alignment_negative_source': self.item_alignment_negative_source,
@@ -393,6 +470,11 @@ class Att_Diffuse_model(nn.Module):
             'x0_item_pos_logit_mean': float(pos_logits.mean().detach().item()),
             'x0_item_neg_logit_mean': float(neg_logits_mean.mean().detach().item()),
             'pref_ratio_loss': float(item_consistency_loss.detach().item()) if self.item_alignment_mode == 'pref_ratio' else 0.0,
+            'kd_loss': float(item_consistency_loss.detach().item()) if self.item_alignment_mode == 'topk_kd' else 0.0,
+            'teacher_topk_entropy': float(teacher_topk_entropy.mean().detach().item()),
+            'teacher_target_rank_in_topk': float(teacher_target_rank.mean().detach().item()),
+            'teacher_topk_logit_mean': float(teacher_topk_logit_mean.mean().detach().item()),
+            'student_topk_logit_mean': float(student_topk_logit_mean.mean().detach().item()),
             'pos_score_mean': float(pos_logits.mean().detach().item()),
             'neg_score_mean': float(neg_logits_mean.mean().detach().item()),
             'pos_minus_neg_gap_mean': float(pos_minus_neg_gap.mean().detach().item()),
