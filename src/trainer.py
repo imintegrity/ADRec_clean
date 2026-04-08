@@ -134,6 +134,12 @@ def build_efficiency_report(model_joint, args):
         'stationary_anchor_scale': getattr(args, 'stationary_anchor_scale', None),
         'stationary_anchor_max_scale': getattr(args, 'stationary_anchor_max_scale', None),
         'stationary_shift_norm_cap': getattr(args, 'stationary_shift_norm_cap', None),
+        'use_positive_negative_guidance': getattr(args, 'use_positive_negative_guidance', None),
+        'negative_condition_source': getattr(args, 'negative_condition_source', None),
+        'negative_condition_topk': getattr(args, 'negative_condition_topk', None),
+        'png_guidance_scale': getattr(args, 'png_guidance_scale', None),
+        'gal_margin': getattr(args, 'gal_margin', None),
+        'gal_weight': getattr(args, 'gal_weight', None),
         'decoder_mode': getattr(decoder, 'decoder_mode', None),
         'decoder_active_components': getattr(decoder, 'active_components', None),
         'tcond_placement': getattr(getattr(diffu_net, 'decoder', None), 'placement', None),
@@ -205,6 +211,7 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
         ce_losses = []
         dif_losses = []
         item_losses = []
+        gal_losses = []
         epoch_tcond_stats = {}
         epoch_tcond_meta = {}
         flag_update = 0
@@ -223,12 +230,16 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             out_seq, last_item = outputs[:2]
             dif_loss = outputs[2] if len(outputs) > 2 and outputs[2] is not None else torch.zeros(1, device=args.device)
             item_consistency_loss = outputs[3] if len(outputs) > 3 and outputs[3] is not None else torch.zeros(1, device=args.device)
+            gal_loss = outputs[4] if len(outputs) > 4 and outputs[4] is not None else torch.zeros(1, device=args.device)
             ce_loss = model_joint.calculate_loss(out_seq, train_batch[1])  ## use this not above
             if args.model=='adrec' and args.loss=='mse':
                 current_item_weight = getattr(model_joint, 'get_current_item_consistency_weight', lambda: getattr(args, 'lambda_item', 0.0))()
+                current_gal_weight = getattr(model_joint, 'get_gal_weight', lambda: getattr(args, 'gal_weight', 0.0))()
                 candidate_losses = [ce_loss, args.loss_scale * dif_loss]
                 if current_item_weight > 0:
                     candidate_losses.append(current_item_weight * item_consistency_loss)
+                if current_gal_weight > 0:
+                    candidate_losses.append(current_gal_weight * gal_loss)
                 losses = [loss for loss in candidate_losses if loss_requires_grad(loss)]
                 if not losses:
                     losses = [ce_loss]
@@ -242,6 +253,7 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             ce_losses.append(ce_loss.item())
             dif_losses.append(dif_loss.item())
             item_losses.append(item_consistency_loss.item())
+            gal_losses.append(gal_loss.item())
             current_tcond_stats = get_tcond_stats(model_joint)
             for key, value in current_tcond_stats.items():
                 if is_numeric_stat(value):
@@ -261,8 +273,9 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
         if is_cuda_device(device):
             peak_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
         avg_item_loss = sum(item_losses) / len(item_losses) if item_losses else 0.0
-        print(f"loss in epoch {epoch_temp}: ce_loss {sum(ce_losses)/len(ce_losses):.3f}, dif_loss {sum(dif_losses)/len(dif_losses):.3f}, item_loss {avg_item_loss:.3f}")
-        logger.info(f"loss in epoch {epoch_temp}: ce_loss {sum(ce_losses)/len(ce_losses):.3f}, dif_loss {sum(dif_losses)/len(dif_losses):.3f}, item_loss {avg_item_loss:.3f}")
+        avg_gal_loss = sum(gal_losses) / len(gal_losses) if gal_losses else 0.0
+        print(f"loss in epoch {epoch_temp}: ce_loss {sum(ce_losses)/len(ce_losses):.3f}, dif_loss {sum(dif_losses)/len(dif_losses):.3f}, item_loss {avg_item_loss:.3f}, gal_loss {avg_gal_loss:.3f}")
+        logger.info(f"loss in epoch {epoch_temp}: ce_loss {sum(ce_losses)/len(ce_losses):.3f}, dif_loss {sum(dif_losses)/len(dif_losses):.3f}, item_loss {avg_item_loss:.3f}, gal_loss {avg_gal_loss:.3f}")
         logger.info(
             "epoch %d efficiency: epoch_time_sec=%.4f avg_step_time_sec=%.6f samples_per_sec=%.4f peak_gpu_mem_mb=%.2f",
             epoch_temp,
@@ -277,6 +290,7 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
             'avg_step_time_sec': avg_step_time,
             'samples_per_sec': samples_per_sec,
             'peak_gpu_mem_mb': peak_memory_mb,
+            'avg_gal_loss': avg_gal_loss,
         }
         if epoch_tcond_stats:
             epoch_tcond_summary = {

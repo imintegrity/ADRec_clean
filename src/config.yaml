@@ -77,6 +77,12 @@ item_consistency_max_weight: 0.2
 stationary_anchor_scale: 0.24
 stationary_anchor_max_scale: 0.24
 stationary_shift_norm_cap: 0.5
+use_positive_negative_guidance: true
+negative_condition_source: confusing_topk_from_main_ce
+negative_condition_topk: 10
+png_guidance_scale: 0.5
+gal_margin: 0.1
+gal_weight: 0.05
 split_onebyone: false  # Split sequence one by one
 noise_schedule: trunc_lin
 beta_a: 0.3 #beta_schedule

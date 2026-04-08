@@ -204,10 +204,17 @@ class AdRec(nn.Module):
         self.stationary_shift_norm_cap = getattr(args, 'stationary_shift_norm_cap', 0.0)
         self.item_consistency_warmup_epochs = getattr(args, 'item_consistency_warmup_epochs', 0)
         self.item_consistency_ramp_epochs = getattr(args, 'item_consistency_ramp_epochs', 0)
+        self.use_positive_negative_guidance = getattr(args, 'use_positive_negative_guidance', False)
+        self.negative_condition_source = getattr(args, 'negative_condition_source', 'confusing_topk_from_main_ce')
+        self.negative_condition_topk = max(int(getattr(args, 'negative_condition_topk', 10)), 1)
+        self.png_guidance_scale = float(getattr(args, 'png_guidance_scale', 0.0))
+        self.negative_condition_chunk_size = max(int(getattr(args, 'item_consistency_chunk_size', 2048)), 1)
         self.current_epoch = 0
         self.current_stationary_anchor_scale = 0.0
         self.latest_stats = {}
         self.set_curriculum_epoch(0)
+        if self.negative_condition_source not in {'confusing_topk_from_main_ce'}:
+            raise ValueError(f"unsupported negative_condition_source: {self.negative_condition_source}")
 
     def _compute_curriculum_weight(self, epoch, max_weight, warmup_epochs, ramp_epochs):
         max_weight = float(max(max_weight, 0.0))
@@ -266,6 +273,64 @@ class AdRec(nn.Module):
 
     def get_latest_stats(self):
         return dict(self.latest_stats)
+
+    def _build_confusing_negative_condition(self, positive_condition, x0_pos, item_embedding_weight, valid_mask, labels=None):
+        negative_condition = torch.zeros_like(positive_condition)
+        stats = {
+            'confusing_negative_score_mean': 0.0,
+            'negative_condition_source': self.negative_condition_source,
+            'negative_condition_topk': int(self.negative_condition_topk),
+        }
+        if item_embedding_weight is None or not valid_mask.any():
+            return negative_condition, stats
+
+        # Stop gradients through the negative-condition builder so GAL/negative branch
+        # only trains the denoiser under the derived repulsive condition.
+        item_emb_norm = F.normalize(item_embedding_weight.detach(), dim=-1)
+        x0_norm = F.normalize(x0_pos.detach(), dim=-1)
+        flat_valid_mask = valid_mask.reshape(-1)
+        flat_x0 = x0_norm.reshape(-1, x0_norm.size(-1))[flat_valid_mask]
+        all_negative_vectors = []
+        all_confusing_scores = []
+
+        if labels is not None:
+            flat_labels = labels.reshape(-1)[flat_valid_mask]
+        else:
+            flat_labels = None
+
+        max_candidates = item_emb_norm.size(0) - 1
+        if max_candidates <= 0:
+            return negative_condition, stats
+
+        for start in range(0, flat_x0.size(0), self.negative_condition_chunk_size):
+            end = min(start + self.negative_condition_chunk_size, flat_x0.size(0))
+            chunk_x0 = flat_x0[start:end]
+            chunk_logits = torch.matmul(chunk_x0, item_emb_norm.t())
+            if chunk_logits.size(-1) > 0:
+                chunk_logits[:, 0] = float('-inf')
+
+            if flat_labels is not None:
+                chunk_labels = flat_labels[start:end]
+                chunk_logits.scatter_(1, chunk_labels.unsqueeze(-1), float('-inf'))
+                topk = max(1, min(self.negative_condition_topk, max(chunk_logits.size(-1) - 2, 1)))
+                topk_scores, topk_indices = torch.topk(chunk_logits, k=topk, dim=-1)
+            else:
+                topk = max(1, min(self.negative_condition_topk + 1, max_candidates))
+                topk_scores, topk_indices = torch.topk(chunk_logits, k=topk, dim=-1)
+                if topk_scores.size(-1) > 1:
+                    topk_scores = topk_scores[:, 1:]
+                    topk_indices = topk_indices[:, 1:]
+
+            attn_weights = F.softmax(topk_scores, dim=-1)
+            negative_vectors = (attn_weights.unsqueeze(-1) * item_emb_norm[topk_indices]).sum(dim=1)
+            all_negative_vectors.append(negative_vectors)
+            all_confusing_scores.append(topk_scores.mean(dim=-1))
+
+        flat_negative_condition = negative_condition.reshape(-1, negative_condition.size(-1))
+        flat_negative_condition[flat_valid_mask] = torch.cat(all_negative_vectors, dim=0).detach()
+        confusing_scores = torch.cat(all_confusing_scores, dim=0)
+        stats['confusing_negative_score_mean'] = float(confusing_scores.mean().detach().item())
+        return negative_condition, stats
 
     def q_sample(self, x_start, t, noise=None, mask=None):
         """
@@ -335,12 +400,25 @@ class AdRec(nn.Module):
         assert (posterior_mean.shape[0] == x_start.shape[0])
         return posterior_mean
 
-    def p_mean_variance(self, rep_item, x_t, t, mask_seq,mask_tag):
+    def p_mean_variance(self, rep_item, x_t, t, mask_seq,mask_tag, item_embedding_weight=None):
         # print("func p_mean_variance", rep_item.shape,x_t.shape)
         if self.cfg_scale==1.:
-            x_0 = self.net(rep_item, x_t, self._scale_timesteps(t), mask_seq,mask_tag)
+            x0_pos = self.net(rep_item, x_t, self._scale_timesteps(t), mask_seq,mask_tag)
         else:
-            x_0 = self.net.forward_cfg(rep_item, x_t, self._scale_timesteps(t), mask_seq, mask_tag,self.cfg_scale)
+            x0_pos = self.net.forward_cfg(rep_item, x_t, self._scale_timesteps(t), mask_seq, mask_tag,self.cfg_scale)
+        x_0 = x0_pos
+        if self.use_positive_negative_guidance and self.png_guidance_scale > 0 and item_embedding_weight is not None:
+            valid_mask = mask_tag > 0
+            negative_condition, negative_stats = self._build_confusing_negative_condition(
+                positive_condition=rep_item,
+                x0_pos=x0_pos,
+                item_embedding_weight=item_embedding_weight,
+                valid_mask=valid_mask,
+                labels=None,
+            )
+            x0_neg = self.net(negative_condition, x_t, self._scale_timesteps(t), mask_seq, mask_tag)
+            x_0 = x0_pos + self.png_guidance_scale * (x0_pos - x0_neg)
+            self.latest_stats.update(negative_stats)
         # x_0 = model_output.unsqueeze(1)  ##output predict
         # x_0 = self._predict_xstart_from_eps(x_t, t, model_output)  ## eps predict
         # x_0 = x_0.clamp_(-1., 1.)
@@ -350,8 +428,8 @@ class AdRec(nn.Module):
         model_mean = self.q_posterior_mean_variance(x_start=x_0, x_t=x_t, t=t)  ## x_start: candidante item embedding, x_t: inputseq_embedding + outseq_noise, output x_(t-1) distribution
         return model_mean, model_log_variance
 
-    def p_sample(self, item_rep, noise_x_t, t, mask_seq,mask_tag):
-        model_mean, model_log_variance = self.p_mean_variance(item_rep, noise_x_t, t, mask_seq,mask_tag)
+    def p_sample(self, item_rep, noise_x_t, t, mask_seq,mask_tag, item_embedding_weight=None):
+        model_mean, model_log_variance = self.p_mean_variance(item_rep, noise_x_t, t, mask_seq,mask_tag, item_embedding_weight=item_embedding_weight)
         noise = th.randn_like(noise_x_t)
         # print("noise shape in func p_sample",noise.shape)
         nonzero_mask = (t != 0).float().unsqueeze(-1)  # no noise when t == 0
@@ -360,7 +438,7 @@ class AdRec(nn.Module):
             sample_xt = F.normalize(sample_xt,p=2,dim=-1)
         return sample_xt
 
-    def denoise_sample(self, seq, tgt, mask_seq, mask_tag):
+    def denoise_sample(self, seq, tgt, mask_seq, mask_tag, item_embedding_weight=None):
         seq = self.ag_encoder(seq, mask_seq)
         tgt = self.build_stationary_target(seq, tgt, mask_seq, mask_tag)
         # return self.xstart_model(item_rep, noise_x_t, th.tensor([1] * item_rep.shape[0], device=item_rep.device), mask_seq)[0]
@@ -370,7 +448,7 @@ class AdRec(nn.Module):
             t = th.tensor([0]*(seq.shape[1]-1) + [i], device=seq.device).unsqueeze(0).repeat(seq.shape[0],1)
             noise_x_t = torch.concat([tgt[:, :-1], noise_x_t[:, -1:]], dim=1)
             # noise_x_t = torch.concat([torch.zeros_like(tgt[:, :-1]),noise_x_t[:, -1:]], dim=1)
-            noise_x_t = self.p_sample(seq, noise_x_t, t, mask_seq, mask_tag)
+            noise_x_t = self.p_sample(seq, noise_x_t, t, mask_seq, mask_tag, item_embedding_weight=item_embedding_weight)
         # print(noise_x_t[0,-1,:10])
         return noise_x_t
 
@@ -383,7 +461,7 @@ class AdRec(nn.Module):
             t, weights = self.schedule_sampler.sample(tgt.shape[0], tgt.device)
             x_t = self.q_sample(tgt, t, mask=mask)
         return x_t,t
-    def forward(self, item_rep, item_tag, mask_seq,mask_tag):
+    def forward(self, item_rep, item_tag, mask_seq,mask_tag, item_embedding_weight=None, labels=None):
         item_rep = self.ag_encoder(item_rep, mask_seq)
         diff_target = self.build_stationary_target(item_rep, item_tag, mask_seq, mask_tag)
         x_t,t = self.independent_diffuse(diff_target, mask_tag, self.independent_diffusion)
@@ -391,10 +469,26 @@ class AdRec(nn.Module):
             mask = torch.rand([mask_seq.shape[0],1,1],device=item_rep.device) > 0.7
             item_rep = torch.where(mask,torch.zeros_like(item_rep),item_rep)
         denoised_seq = self.net(item_rep, x_t, self._scale_timesteps(t), mask_seq,mask_tag)  ##output predict
+        png_payload = None
+        if self.use_positive_negative_guidance and item_embedding_weight is not None:
+            negative_condition, negative_stats = self._build_confusing_negative_condition(
+                positive_condition=item_rep,
+                x0_pos=denoised_seq,
+                item_embedding_weight=item_embedding_weight,
+                valid_mask=mask_tag > 0,
+                labels=labels,
+            )
+            denoised_seq_neg = self.net(negative_condition, x_t, self._scale_timesteps(t), mask_seq, mask_tag)
+            self.latest_stats.update(negative_stats)
+            png_payload = {
+                'x0_neg': denoised_seq_neg,
+                'negative_condition': negative_condition,
+                'confusing_negative_score_mean': negative_stats['confusing_negative_score_mean'],
+            }
         # print(denoised_seq.shape,item_tag.shape,mask_tag.shape)
         losses = F.mse_loss(denoised_seq,diff_target, reduction='none')* (mask_tag / mask_tag.sum(1,keepdim=True)).unsqueeze(-1)
         losses = losses.sum(1).mean()
-        return denoised_seq, losses, t
+        return denoised_seq, losses, t, png_payload
 
 
 

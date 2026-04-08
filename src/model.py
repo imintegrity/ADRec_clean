@@ -58,6 +58,12 @@ class Att_Diffuse_model(nn.Module):
         self.item_consistency_temperature = getattr(args, 'item_consistency_temperature', self.item_alignment_temperature)
         self.item_consistency_snr_power = getattr(args, 'item_consistency_snr_power', 1.0)
         self.item_consistency_chunk_size = getattr(args, 'item_consistency_chunk_size', 2048)
+        self.use_positive_negative_guidance = getattr(args, 'use_positive_negative_guidance', False)
+        self.negative_condition_source = getattr(args, 'negative_condition_source', 'confusing_topk_from_main_ce')
+        self.negative_condition_topk = max(int(getattr(args, 'negative_condition_topk', 10)), 1)
+        self.png_guidance_scale = float(getattr(args, 'png_guidance_scale', 0.0))
+        self.gal_margin = float(getattr(args, 'gal_margin', 0.1))
+        self.gal_weight = float(getattr(args, 'gal_weight', 0.05))
         if self.item_alignment_mode not in {'ce', 'topk_kd', 'pref_ratio', 'cosine_margin_ce'}:
             raise ValueError(f"unsupported item_alignment_mode: {self.item_alignment_mode}")
         if self.item_alignment_teacher_source not in {'main_ce_head'}:
@@ -67,6 +73,7 @@ class Att_Diffuse_model(nn.Module):
         self.current_epoch = 0
         self.current_item_consistency_weight = 0.0
         self.latest_item_consistency_stats = {}
+        self.latest_png_stats = {}
         self.set_curriculum_epoch(0)
     def load_pretrained_emb_weight(self):
 
@@ -191,6 +198,73 @@ class Att_Diffuse_model(nn.Module):
 
     def get_current_item_consistency_weight(self):
         return float(self.current_item_consistency_weight)
+
+    def get_gal_weight(self):
+        return float(self.gal_weight if self.use_positive_negative_guidance else 0.0)
+
+    def _reset_png_stats(self):
+        self.latest_png_stats = {
+            'use_positive_negative_guidance': bool(self.use_positive_negative_guidance),
+            'negative_condition_source': self.negative_condition_source,
+            'negative_condition_topk': int(self.negative_condition_topk),
+            'png_guidance_scale': float(self.png_guidance_scale),
+            'gal_margin': float(self.gal_margin),
+            'gal_weight': float(self.gal_weight),
+            'gal_loss': 0.0,
+            'pos_branch_target_cos': 0.0,
+            'neg_branch_target_cos': 0.0,
+            'pos_minus_neg_target_gap': 0.0,
+            'confusing_negative_score_mean': 0.0,
+            'x0_pos_item_top1_acc': 0.0,
+            'x0_neg_item_top1_acc': 0.0,
+        }
+
+    def _compute_branch_top1_acc(self, branch_seq, labels):
+        valid_mask = labels > 0
+        if not valid_mask.any():
+            return 0.0
+        branch_norm = F.normalize(branch_seq, dim=-1)
+        item_emb_norm = F.normalize(self.item_embedding.weight, dim=-1)
+        flat_branch = branch_norm[valid_mask]
+        flat_labels = labels[valid_mask]
+        total_correct = 0.0
+        total_examples = int(flat_labels.numel())
+        chunk_size = max(int(self.item_consistency_chunk_size), 1)
+        for start in range(0, flat_labels.size(0), chunk_size):
+            end = min(start + chunk_size, flat_labels.size(0))
+            logits = torch.matmul(flat_branch[start:end], item_emb_norm.t())
+            preds = logits.argmax(dim=-1)
+            total_correct += float((preds == flat_labels[start:end]).float().sum().detach().item())
+        return total_correct / max(total_examples, 1)
+
+    def compute_positive_negative_guidance_loss(self, x0_pos, png_payload, target_embeddings, labels):
+        self._reset_png_stats()
+        if not self.use_positive_negative_guidance or png_payload is None or 'x0_neg' not in png_payload:
+            return x0_pos.new_zeros(())
+
+        valid_mask = labels > 0
+        if not valid_mask.any():
+            return x0_pos.new_zeros(())
+
+        x0_neg = png_payload['x0_neg']
+        target_norm = F.normalize(target_embeddings, dim=-1)
+        pos_norm = F.normalize(x0_pos, dim=-1)
+        neg_norm = F.normalize(x0_neg, dim=-1)
+
+        pos_cos = (pos_norm * target_norm).sum(dim=-1)[valid_mask]
+        neg_cos = (neg_norm * target_norm).sum(dim=-1)[valid_mask]
+        gal_loss = F.relu(self.gal_margin - (pos_cos - neg_cos)).mean()
+
+        self.latest_png_stats.update({
+            'gal_loss': float(gal_loss.detach().item()),
+            'pos_branch_target_cos': float(pos_cos.mean().detach().item()),
+            'neg_branch_target_cos': float(neg_cos.mean().detach().item()),
+            'pos_minus_neg_target_gap': float((pos_cos - neg_cos).mean().detach().item()),
+            'confusing_negative_score_mean': float(png_payload.get('confusing_negative_score_mean', 0.0)),
+            'x0_pos_item_top1_acc': float(self._compute_branch_top1_acc(x0_pos, labels)),
+            'x0_neg_item_top1_acc': float(self._compute_branch_top1_acc(x0_neg, labels)),
+        })
+        return gal_loss
 
     def _sample_random_negatives(self, positive_labels, num_negatives):
         if num_negatives <= 0:
@@ -484,6 +558,7 @@ class Att_Diffuse_model(nn.Module):
 
     def get_latest_aux_stats(self):
         merged_stats = dict(self.latest_item_consistency_stats)
+        merged_stats.update(self.latest_png_stats)
         if hasattr(self.diffu, 'get_latest_stats'):
             merged_stats.update(self.diffu.get_latest_stats())
         return merged_stats
@@ -505,6 +580,7 @@ class Att_Diffuse_model(nn.Module):
 
     def forward(self, sequence, tag, train_flag=True):
         item_embeddings, tag_embeddings, mask_seq, mask_tag = self.prepare_inputs(sequence, tag)
+        self._reset_png_stats()
 
         # out_seq = item_embeddings
         # last_item = item_embeddings[:, -1, :]
@@ -512,11 +588,20 @@ class Att_Diffuse_model(nn.Module):
         if train_flag:
             # pass
 
-            diffu_outputs = self.diffu(item_embeddings, tag_embeddings, mask_seq, mask_tag)
+            diffu_outputs = self.diffu(
+                item_embeddings,
+                tag_embeddings,
+                mask_seq,
+                mask_tag,
+                item_embedding_weight=self.item_embedding.weight,
+                labels=tag,
+            )
             out_seq, dif_loss = diffu_outputs[:2]
             timesteps = diffu_outputs[2] if len(diffu_outputs) > 2 else None
+            png_payload = diffu_outputs[3] if len(diffu_outputs) > 3 else None
             last_item = out_seq[:, -1, :]
             item_consistency_loss = self.compute_item_consistency_loss(out_seq, tag, timesteps) if timesteps is not None else out_seq.new_zeros(())
+            gal_loss = self.compute_positive_negative_guidance_loss(out_seq, png_payload, tag_embeddings, tag)
 
             # item_rep_dis = self.regularization_rep(rep_item, mask_seq)
             # seq_rep_dis = self.regularization_seq_item_rep(last_item, rep_item, mask_seq)
@@ -524,21 +609,35 @@ class Att_Diffuse_model(nn.Module):
         else:
             # noise_x_t = th.randn_like(tag_emb)
             # print("noise_x_t",noise_x_t.shape)
-            out_seq = self.diffu.denoise_sample(item_embeddings, tag_embeddings, mask_seq, mask_tag)
+            out_seq = self.diffu.denoise_sample(
+                item_embeddings,
+                tag_embeddings,
+                mask_seq,
+                mask_tag,
+                item_embedding_weight=self.item_embedding.weight,
+            )
             # out_seq = self.diffu.subseq_guidence(item_embeddings, tag_embeddings, mask_seq, mask_tag)
             last_item = out_seq[:, -1, :]
             dif_loss = None
             item_consistency_loss = None
+            gal_loss = None
             self.latest_item_consistency_stats = {}
         # item_rep = self.model_main(item_embeddings, last_item, mask_seq)
         # seq_rep = item_rep[:, -1, :]
         # scores = torch.matmul(seq_rep, self.item_embeddings.weight.t())
             # scores = None
-        return out_seq, last_item, dif_loss, item_consistency_loss
+        return out_seq, last_item, dif_loss, item_consistency_loss, gal_loss
 
     def denoise_sample_only(self, sequence, tag):
         item_embeddings, tag_embeddings, mask_seq, mask_tag = self.prepare_inputs(sequence, tag)
-        out_seq = self.diffu.denoise_sample(item_embeddings, tag_embeddings, mask_seq, mask_tag)
+        self._reset_png_stats()
+        out_seq = self.diffu.denoise_sample(
+            item_embeddings,
+            tag_embeddings,
+            mask_seq,
+            mask_tag,
+            item_embedding_weight=self.item_embedding.weight,
+        )
         return out_seq, out_seq[:, -1, :]
 
 
