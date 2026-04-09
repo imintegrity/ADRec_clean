@@ -64,6 +64,11 @@ class Att_Diffuse_model(nn.Module):
         self.png_guidance_scale = float(getattr(args, 'png_guidance_scale', 0.0))
         self.gal_margin = float(getattr(args, 'gal_margin', 0.1))
         self.gal_weight = float(getattr(args, 'gal_weight', 0.05))
+        self.prediction_target_mode = getattr(args, 'prediction_target_mode', 'pref_state')
+        self.pref_teacher_topk = max(int(getattr(args, 'pref_teacher_topk', 20)), 1)
+        self.pref_teacher_temperature = float(getattr(args, 'pref_teacher_temperature', 1.0))
+        self.pref_mix_topk_alpha = float(getattr(args, 'pref_mix_topk_alpha', 0.30))
+        self.pref_mix_stationary_beta = float(getattr(args, 'pref_mix_stationary_beta', 0.20))
         if self.item_alignment_mode not in {'ce', 'topk_kd', 'pref_ratio', 'cosine_margin_ce'}:
             raise ValueError(f"unsupported item_alignment_mode: {self.item_alignment_mode}")
         if self.item_alignment_teacher_source not in {'main_ce_head'}:
@@ -217,6 +222,11 @@ class Att_Diffuse_model(nn.Module):
             'confusing_negative_score_mean': 0.0,
             'x0_pos_item_top1_acc': 0.0,
             'x0_neg_item_top1_acc': 0.0,
+            'prediction_target_mode': self.prediction_target_mode,
+            'pref_teacher_topk': int(self.pref_teacher_topk),
+            'pref_teacher_temperature': float(self.pref_teacher_temperature),
+            'pref_mix_topk_alpha': float(self.pref_mix_topk_alpha),
+            'pref_mix_stationary_beta': float(self.pref_mix_stationary_beta),
         }
 
     def _compute_branch_top1_acc(self, branch_seq, labels):
@@ -615,6 +625,7 @@ class Att_Diffuse_model(nn.Module):
                 mask_seq,
                 mask_tag,
                 item_embedding_weight=self.item_embedding.weight,
+                labels=tag,
             )
             # out_seq = self.diffu.subseq_guidence(item_embeddings, tag_embeddings, mask_seq, mask_tag)
             last_item = out_seq[:, -1, :]
@@ -637,6 +648,7 @@ class Att_Diffuse_model(nn.Module):
             mask_seq,
             mask_tag,
             item_embedding_weight=self.item_embedding.weight,
+            labels=tag,
         )
         return out_seq, out_seq[:, -1, :]
 

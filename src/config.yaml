@@ -77,6 +77,11 @@ item_consistency_max_weight: 0.2
 stationary_anchor_scale: 0.24
 stationary_anchor_max_scale: 0.24
 stationary_shift_norm_cap: 0.5
+prediction_target_mode: pref_state
+pref_teacher_topk: 20
+pref_teacher_temperature: 1.0
+pref_mix_topk_alpha: 0.30
+pref_mix_stationary_beta: 0.20
 use_positive_negative_guidance: true
 negative_condition_source: confusing_topk_from_main_ce
 negative_condition_topk: 10

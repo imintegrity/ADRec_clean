@@ -25,6 +25,7 @@ def main():
         'freeze_emb': args.freeze_emb,
         'embedding_warmup_epochs': getattr(args, 'embedding_warmup_epochs', None),
         'dif_decoder': args.dif_decoder,
+        'prediction_target_mode': getattr(args, 'prediction_target_mode', None),
     }
     logger.info(f"Resolved recipe: {resolved_recipe}")
     print(f"Resolved recipe: {resolved_recipe}")

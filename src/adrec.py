@@ -209,12 +209,25 @@ class AdRec(nn.Module):
         self.negative_condition_topk = max(int(getattr(args, 'negative_condition_topk', 10)), 1)
         self.png_guidance_scale = float(getattr(args, 'png_guidance_scale', 0.0))
         self.negative_condition_chunk_size = max(int(getattr(args, 'item_consistency_chunk_size', 2048)), 1)
+        self.prediction_target_mode = getattr(args, 'prediction_target_mode', 'pref_state')
+        self.pref_teacher_topk = max(int(getattr(args, 'pref_teacher_topk', 20)), 1)
+        self.pref_teacher_temperature = float(getattr(args, 'pref_teacher_temperature', 1.0))
+        self.pref_mix_topk_alpha = float(getattr(args, 'pref_mix_topk_alpha', 0.30))
+        self.pref_mix_stationary_beta = float(getattr(args, 'pref_mix_stationary_beta', 0.20))
         self.current_epoch = 0
         self.current_stationary_anchor_scale = 0.0
         self.latest_stats = {}
         self.set_curriculum_epoch(0)
         if self.negative_condition_source not in {'confusing_topk_from_main_ce'}:
             raise ValueError(f"unsupported negative_condition_source: {self.negative_condition_source}")
+        if self.prediction_target_mode not in {'item_emb', 'pref_state'}:
+            raise ValueError(f"unsupported prediction_target_mode: {self.prediction_target_mode}")
+        if self.pref_teacher_temperature <= 0:
+            raise ValueError("pref_teacher_temperature must be positive")
+        if self.pref_mix_topk_alpha < 0 or self.pref_mix_stationary_beta < 0:
+            raise ValueError("preference-state mixing weights must be non-negative")
+        if self.pref_mix_topk_alpha + self.pref_mix_stationary_beta >= 1.0:
+            raise ValueError("pref_mix_topk_alpha + pref_mix_stationary_beta must be < 1.0")
 
     def _compute_curriculum_weight(self, epoch, max_weight, warmup_epochs, ramp_epochs):
         max_weight = float(max(max_weight, 0.0))
@@ -242,9 +255,12 @@ class AdRec(nn.Module):
             'stationary_shift_norm_cap': float(self.stationary_shift_norm_cap),
         })
 
-    def build_stationary_target(self, hist_rep, item_tag, mask_seq, mask_tag):
-        if self.stationary_latent_mode == 'none':
-            return item_tag
+    def _masked_mean(self, tensor, mask):
+        mask = mask.float()
+        denom = mask.sum().clamp_min(1.0)
+        return float((tensor * mask).sum().detach().item() / denom.detach().item())
+
+    def _compute_stationary_components(self, hist_rep, item_tag, mask_seq):
         anchor_denom = mask_seq.sum(1, keepdim=True).clamp_min(1.0).unsqueeze(-1)
         stationary_anchor = (hist_rep * mask_seq.unsqueeze(-1)).sum(1, keepdim=True) / anchor_denom
         anchor_shift = stationary_anchor - item_tag
@@ -252,11 +268,48 @@ class AdRec(nn.Module):
         if self.stationary_shift_norm_cap and self.stationary_shift_norm_cap > 0:
             capped_shift_norm = raw_shift_norm.clamp(max=self.stationary_shift_norm_cap)
             anchor_shift = anchor_shift * (capped_shift_norm / raw_shift_norm.clamp_min(1e-6)).unsqueeze(-1)
+        return stationary_anchor, anchor_shift, raw_shift_norm
+
+    def build_stationary_target(self, hist_rep, item_tag, mask_seq, mask_tag):
+        if self.stationary_latent_mode == 'none':
+            valid_mask = mask_tag.float()
+            self.latest_stats = {
+                'prediction_target_mode': self.prediction_target_mode,
+                'pref_teacher_topk': int(self.pref_teacher_topk),
+                'pref_teacher_temperature': float(self.pref_teacher_temperature),
+                'pref_mix_topk_alpha': float(self.pref_mix_topk_alpha),
+                'pref_mix_stationary_beta': float(self.pref_mix_stationary_beta),
+                'stationary_latent_mode': self.stationary_latent_mode,
+                'stationary_anchor_scale': float(self.stationary_anchor_scale),
+                'stationary_anchor_max_scale': float(self.stationary_anchor_max_scale),
+                'stationary_effective_anchor_scale': float(self.current_stationary_anchor_scale),
+                'stationary_shift_norm_cap': float(self.stationary_shift_norm_cap),
+                'stationary_anchor_norm_mean': 0.0,
+                'stationary_anchor_norm_std': 0.0,
+                'stationary_raw_shift_norm_mean': 0.0,
+                'stationary_raw_shift_norm_std': 0.0,
+                'stationary_target_shift_norm_mean': 0.0,
+                'stationary_target_shift_norm_std': 0.0,
+                'pref_teacher_target_rank_in_topk': 0.0,
+                'pref_teacher_entropy': 0.0,
+                'pref_teacher_norm': self._masked_mean(item_tag.norm(dim=-1), valid_mask),
+                'pref_target_shift_norm': 0.0,
+                'z_pref_hat_to_target_cos': 0.0,
+                'z_pref_hat_to_stationary_cos': 0.0,
+                'x0_item_top1_acc': 0.0,
+            }
+            return item_tag
+        stationary_anchor, anchor_shift, raw_shift_norm = self._compute_stationary_components(hist_rep, item_tag, mask_seq)
         target_latent = item_tag + self.current_stationary_anchor_scale * anchor_shift
         target_latent = target_latent * mask_tag.unsqueeze(-1)
         anchor_norm = stationary_anchor.norm(dim=-1)
         shift_norm = (target_latent - item_tag).norm(dim=-1)
         self.latest_stats = {
+            'prediction_target_mode': self.prediction_target_mode,
+            'pref_teacher_topk': int(self.pref_teacher_topk),
+            'pref_teacher_temperature': float(self.pref_teacher_temperature),
+            'pref_mix_topk_alpha': float(self.pref_mix_topk_alpha),
+            'pref_mix_stationary_beta': float(self.pref_mix_stationary_beta),
             'stationary_latent_mode': self.stationary_latent_mode,
             'stationary_anchor_scale': float(self.stationary_anchor_scale),
             'stationary_anchor_max_scale': float(self.stationary_anchor_max_scale),
@@ -268,8 +321,132 @@ class AdRec(nn.Module):
             'stationary_raw_shift_norm_std': float(raw_shift_norm.std(unbiased=False).detach().item()),
             'stationary_target_shift_norm_mean': float(shift_norm.mean().detach().item()),
             'stationary_target_shift_norm_std': float(shift_norm.std(unbiased=False).detach().item()),
+            'pref_teacher_target_rank_in_topk': 0.0,
+            'pref_teacher_entropy': 0.0,
+            'pref_teacher_norm': 0.0,
+            'pref_target_shift_norm': 0.0,
+            'z_pref_hat_to_target_cos': 0.0,
+            'z_pref_hat_to_stationary_cos': 0.0,
+            'x0_item_top1_acc': 0.0,
         }
         return target_latent
+
+    def _build_pref_teacher_topk(self, teacher_state, target_labels, item_embedding_weight, valid_mask):
+        item_weight_detached = item_embedding_weight.detach()
+        item_emb_for_logits = F.normalize(item_weight_detached, dim=-1)
+        teacher_state = F.normalize(teacher_state.detach(), dim=-1)
+        flat_valid_mask = valid_mask.reshape(-1)
+        flat_teacher_state = teacher_state.reshape(-1, teacher_state.size(-1))[flat_valid_mask]
+        flat_target_labels = target_labels.reshape(-1)[flat_valid_mask]
+        flat_prototype = teacher_state.new_zeros((flat_teacher_state.size(0), teacher_state.size(-1)))
+        flat_entropy = teacher_state.new_zeros(flat_teacher_state.size(0))
+        flat_rank = teacher_state.new_zeros(flat_teacher_state.size(0))
+        if flat_teacher_state.size(0) == 0:
+            return flat_prototype, flat_entropy, flat_rank
+
+        max_available = max(item_emb_for_logits.size(0) - 1, 1)
+        teacher_topk = min(self.pref_teacher_topk, max_available)
+        for start in range(0, flat_teacher_state.size(0), self.negative_condition_chunk_size):
+            end = min(start + self.negative_condition_chunk_size, flat_teacher_state.size(0))
+            chunk_state = flat_teacher_state[start:end]
+            chunk_labels = flat_target_labels[start:end]
+            chunk_logits = torch.matmul(chunk_state, item_emb_for_logits.t())
+            if chunk_logits.size(-1) > 0:
+                chunk_logits[:, 0] = float('-inf')
+            chunk_topk_logits, chunk_topk_indices = torch.topk(chunk_logits, k=teacher_topk, dim=-1)
+            target_in_topk = chunk_topk_indices.eq(chunk_labels.unsqueeze(-1))
+            missing_mask = ~target_in_topk.any(dim=-1)
+            if missing_mask.any():
+                chunk_topk_indices[missing_mask, -1] = chunk_labels[missing_mask]
+                chunk_topk_logits[missing_mask, -1] = chunk_logits[missing_mask, chunk_labels[missing_mask]]
+            sorted_logits, sorted_order = torch.sort(chunk_topk_logits, dim=-1, descending=True)
+            sorted_indices = chunk_topk_indices.gather(-1, sorted_order)
+            teacher_probs = F.softmax(sorted_logits / self.pref_teacher_temperature, dim=-1)
+            flat_prototype[start:end] = (teacher_probs.unsqueeze(-1) * item_weight_detached[sorted_indices]).sum(dim=1)
+            flat_entropy[start:end] = -(teacher_probs * torch.log(teacher_probs.clamp_min(1e-12))).sum(dim=-1)
+            flat_rank[start:end] = sorted_indices.eq(chunk_labels.unsqueeze(-1)).float().argmax(dim=-1).float() + 1.0
+        return flat_prototype, flat_entropy, flat_rank
+
+    def build_diffusion_target(self, hist_rep, item_tag, mask_seq, mask_tag, item_embedding_weight=None, labels=None):
+        stationary_target = self.build_stationary_target(hist_rep, item_tag, mask_seq, mask_tag)
+        stationary_anchor, _, _ = self._compute_stationary_components(hist_rep, item_tag, mask_seq)
+        valid_mask = mask_tag > 0
+        if self.prediction_target_mode != 'pref_state':
+            return stationary_target, stationary_anchor
+
+        if item_embedding_weight is None or labels is None:
+            raise ValueError("pref_state mode requires item_embedding_weight and labels")
+
+        teacher_state = hist_rep
+        flat_prototype, flat_entropy, flat_rank = self._build_pref_teacher_topk(
+            teacher_state=teacher_state,
+            target_labels=labels,
+            item_embedding_weight=item_embedding_weight,
+            valid_mask=valid_mask,
+        )
+        p_topk = item_tag.new_zeros(item_tag.shape)
+        p_topk.reshape(-1, p_topk.size(-1))[valid_mask.reshape(-1)] = flat_prototype
+
+        target_weight = 1.0 - self.pref_mix_topk_alpha - self.pref_mix_stationary_beta
+        z_pref_teacher = (
+            target_weight * item_tag
+            + self.pref_mix_topk_alpha * p_topk
+            + self.pref_mix_stationary_beta * stationary_anchor
+        )
+        z_pref_teacher = F.normalize(z_pref_teacher, dim=-1)
+        z_pref_teacher = z_pref_teacher * mask_tag.unsqueeze(-1)
+        z_pref_teacher = z_pref_teacher.detach()
+
+        pref_shift_norm = (z_pref_teacher - item_tag).norm(dim=-1)
+        pref_teacher_norm = z_pref_teacher.norm(dim=-1)
+        valid_mask_float = valid_mask.float()
+        rank_tensor = item_tag.new_zeros(labels.shape)
+        rank_tensor = rank_tensor.masked_scatter(valid_mask, flat_rank.to(rank_tensor.dtype))
+        entropy_tensor = item_tag.new_zeros(labels.shape)
+        entropy_tensor = entropy_tensor.masked_scatter(valid_mask, flat_entropy.to(entropy_tensor.dtype))
+        self.latest_stats.update({
+            'pref_teacher_target_rank_in_topk': self._masked_mean(rank_tensor, valid_mask_float),
+            'pref_teacher_entropy': self._masked_mean(entropy_tensor, valid_mask_float),
+            'pref_teacher_norm': self._masked_mean(pref_teacher_norm, valid_mask_float),
+            'pref_target_shift_norm': self._masked_mean(pref_shift_norm, valid_mask_float),
+        })
+        return z_pref_teacher, stationary_anchor
+
+    def _compute_x0_item_top1_acc(self, x0_seq, labels, item_embedding_weight, valid_mask):
+        if item_embedding_weight is None or labels is None or not valid_mask.any():
+            return 0.0
+        flat_x0 = F.normalize(x0_seq, dim=-1).reshape(-1, x0_seq.size(-1))[valid_mask.reshape(-1)]
+        flat_labels = labels.reshape(-1)[valid_mask.reshape(-1)]
+        item_emb_norm = F.normalize(item_embedding_weight, dim=-1)
+        total_correct = 0.0
+        total_examples = max(int(flat_labels.numel()), 1)
+        chunk_size = max(int(self.negative_condition_chunk_size), 1)
+        for start in range(0, flat_labels.size(0), chunk_size):
+            end = min(start + chunk_size, flat_labels.size(0))
+            chunk_logits = torch.matmul(flat_x0[start:end], item_emb_norm.t())
+            total_correct += float((chunk_logits.argmax(dim=-1) == flat_labels[start:end]).float().sum().detach().item())
+        return total_correct / total_examples
+
+    def _update_prediction_geometry_stats(self, denoised_seq, item_tag, stationary_anchor, mask_tag, item_embedding_weight=None, labels=None):
+        valid_mask = mask_tag > 0
+        if not valid_mask.any():
+            self.latest_stats.update({
+                'z_pref_hat_to_target_cos': 0.0,
+                'z_pref_hat_to_stationary_cos': 0.0,
+                'x0_item_top1_acc': 0.0,
+            })
+            return
+        x0_norm = F.normalize(denoised_seq, dim=-1)
+        target_norm = F.normalize(item_tag, dim=-1)
+        stationary_norm = F.normalize(stationary_anchor, dim=-1)
+        target_cos = (x0_norm * target_norm).sum(dim=-1)
+        stationary_cos = (x0_norm * stationary_norm).sum(dim=-1)
+        valid_mask_float = valid_mask.float()
+        self.latest_stats.update({
+            'z_pref_hat_to_target_cos': self._masked_mean(target_cos, valid_mask_float),
+            'z_pref_hat_to_stationary_cos': self._masked_mean(stationary_cos, valid_mask_float),
+            'x0_item_top1_acc': float(self._compute_x0_item_top1_acc(denoised_seq, labels, item_embedding_weight, valid_mask)),
+        })
 
     def get_latest_stats(self):
         return dict(self.latest_stats)
@@ -438,9 +615,17 @@ class AdRec(nn.Module):
             sample_xt = F.normalize(sample_xt,p=2,dim=-1)
         return sample_xt
 
-    def denoise_sample(self, seq, tgt, mask_seq, mask_tag, item_embedding_weight=None):
+    def denoise_sample(self, seq, tgt, mask_seq, mask_tag, item_embedding_weight=None, labels=None):
         seq = self.ag_encoder(seq, mask_seq)
-        tgt = self.build_stationary_target(seq, tgt, mask_seq, mask_tag)
+        item_target = tgt
+        tgt, stationary_anchor = self.build_diffusion_target(
+            seq,
+            tgt,
+            mask_seq,
+            mask_tag,
+            item_embedding_weight=item_embedding_weight,
+            labels=labels,
+        )
         # return self.xstart_model(item_rep, noise_x_t, th.tensor([1] * item_rep.shape[0], device=item_rep.device), mask_seq)[0]
         noise_x_t = th.randn_like(tgt)
         indices = list(range(self.num_timesteps))[::-1]
@@ -450,6 +635,14 @@ class AdRec(nn.Module):
             # noise_x_t = torch.concat([torch.zeros_like(tgt[:, :-1]),noise_x_t[:, -1:]], dim=1)
             noise_x_t = self.p_sample(seq, noise_x_t, t, mask_seq, mask_tag, item_embedding_weight=item_embedding_weight)
         # print(noise_x_t[0,-1,:10])
+        self._update_prediction_geometry_stats(
+            denoised_seq=noise_x_t,
+            item_tag=item_target,
+            stationary_anchor=stationary_anchor,
+            mask_tag=mask_tag,
+            item_embedding_weight=item_embedding_weight,
+            labels=labels,
+        )
         return noise_x_t
 
     def independent_diffuse(self, tgt, mask, is_independent=False):
@@ -463,7 +656,14 @@ class AdRec(nn.Module):
         return x_t,t
     def forward(self, item_rep, item_tag, mask_seq,mask_tag, item_embedding_weight=None, labels=None):
         item_rep = self.ag_encoder(item_rep, mask_seq)
-        diff_target = self.build_stationary_target(item_rep, item_tag, mask_seq, mask_tag)
+        diff_target, stationary_anchor = self.build_diffusion_target(
+            item_rep,
+            item_tag,
+            mask_seq,
+            mask_tag,
+            item_embedding_weight=item_embedding_weight,
+            labels=labels,
+        )
         x_t,t = self.independent_diffuse(diff_target, mask_tag, self.independent_diffusion)
         if self.cfg_scale != 1:
             mask = torch.rand([mask_seq.shape[0],1,1],device=item_rep.device) > 0.7
@@ -485,6 +685,14 @@ class AdRec(nn.Module):
                 'negative_condition': negative_condition,
                 'confusing_negative_score_mean': negative_stats['confusing_negative_score_mean'],
             }
+        self._update_prediction_geometry_stats(
+            denoised_seq=denoised_seq,
+            item_tag=item_tag,
+            stationary_anchor=stationary_anchor,
+            mask_tag=mask_tag,
+            item_embedding_weight=item_embedding_weight,
+            labels=labels,
+        )
         # print(denoised_seq.shape,item_tag.shape,mask_tag.shape)
         losses = F.mse_loss(denoised_seq,diff_target, reduction='none')* (mask_tag / mask_tag.sum(1,keepdim=True)).unsqueeze(-1)
         losses = losses.sum(1).mean()
