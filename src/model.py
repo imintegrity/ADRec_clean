@@ -69,12 +69,16 @@ class Att_Diffuse_model(nn.Module):
         self.pref_teacher_temperature = float(getattr(args, 'pref_teacher_temperature', 1.0))
         self.pref_mix_topk_alpha = float(getattr(args, 'pref_mix_topk_alpha', 0.30))
         self.pref_mix_stationary_beta = float(getattr(args, 'pref_mix_stationary_beta', 0.20))
-        self.generative_process_mode = getattr(args, 'generative_process_mode', 'flow_matching')
+        self.generative_process_mode = getattr(args, 'generative_process_mode', 'diffusion')
         self.flow_source_mode = getattr(args, 'flow_source_mode', 'stationary_anchor')
         self.flow_source_hist_blend_rho = float(getattr(args, 'flow_source_hist_blend_rho', 0.0))
         self.flow_num_steps = max(int(getattr(args, 'flow_num_steps', getattr(args, 'diffusion_steps', 32))), 1)
         self.flow_time_schedule = getattr(args, 'flow_time_schedule', 'linear')
         self.flow_loss_weight = float(getattr(args, 'flow_loss_weight', 1.0))
+        self.trajectory_consistency_mode = getattr(args, 'trajectory_consistency_mode', 'td_adjacent')
+        self.td_delta_step = max(int(getattr(args, 'td_delta_step', 1)), 1)
+        self.td_loss_weight = float(getattr(args, 'td_loss_weight', 0.05))
+        self.td_weighting_mode = getattr(args, 'td_weighting_mode', 'snr')
         if self.item_alignment_mode not in {'ce', 'topk_kd', 'pref_ratio', 'cosine_margin_ce'}:
             raise ValueError(f"unsupported item_alignment_mode: {self.item_alignment_mode}")
         if self.item_alignment_teacher_source not in {'main_ce_head'}:
@@ -239,6 +243,10 @@ class Att_Diffuse_model(nn.Module):
             'flow_num_steps': int(self.flow_num_steps),
             'flow_time_schedule': self.flow_time_schedule,
             'flow_loss_weight': float(self.flow_loss_weight),
+            'trajectory_consistency_mode': self.trajectory_consistency_mode,
+            'td_delta_step': int(self.td_delta_step),
+            'td_loss_weight': float(self.td_loss_weight),
+            'td_weighting_mode': self.td_weighting_mode,
         }
 
     def _compute_branch_top1_acc(self, branch_seq, labels):

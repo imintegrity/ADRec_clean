@@ -82,12 +82,16 @@ pref_teacher_topk: 20
 pref_teacher_temperature: 1.0
 pref_mix_topk_alpha: 0.30
 pref_mix_stationary_beta: 0.20
-generative_process_mode: flow_matching
+generative_process_mode: diffusion
 flow_source_mode: stationary_anchor
 flow_source_hist_blend_rho: 0.0
 flow_num_steps: 32
 flow_time_schedule: linear
 flow_loss_weight: 1.0
+trajectory_consistency_mode: td_adjacent
+td_delta_step: 1
+td_loss_weight: 0.05
+td_weighting_mode: snr
 use_positive_negative_guidance: false
 negative_condition_source: confusing_topk_from_main_ce
 negative_condition_topk: 10

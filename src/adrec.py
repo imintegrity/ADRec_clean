@@ -214,12 +214,16 @@ class AdRec(nn.Module):
         self.pref_teacher_temperature = float(getattr(args, 'pref_teacher_temperature', 1.0))
         self.pref_mix_topk_alpha = float(getattr(args, 'pref_mix_topk_alpha', 0.30))
         self.pref_mix_stationary_beta = float(getattr(args, 'pref_mix_stationary_beta', 0.20))
-        self.generative_process_mode = getattr(args, 'generative_process_mode', 'flow_matching')
+        self.generative_process_mode = getattr(args, 'generative_process_mode', 'diffusion')
         self.flow_source_mode = getattr(args, 'flow_source_mode', 'stationary_anchor')
         self.flow_source_hist_blend_rho = float(getattr(args, 'flow_source_hist_blend_rho', 0.0))
         self.flow_num_steps = max(int(getattr(args, 'flow_num_steps', self.diffusion_steps)), 1)
         self.flow_time_schedule = getattr(args, 'flow_time_schedule', 'linear')
         self.flow_loss_weight = float(getattr(args, 'flow_loss_weight', 1.0))
+        self.trajectory_consistency_mode = getattr(args, 'trajectory_consistency_mode', 'td_adjacent')
+        self.td_delta_step = max(int(getattr(args, 'td_delta_step', 1)), 1)
+        self.td_loss_weight = float(getattr(args, 'td_loss_weight', 0.05))
+        self.td_weighting_mode = getattr(args, 'td_weighting_mode', 'snr')
         self.current_epoch = 0
         self.current_stationary_anchor_scale = 0.0
         self.latest_stats = {}
@@ -236,6 +240,12 @@ class AdRec(nn.Module):
             raise ValueError("flow_source_hist_blend_rho must be in [0, 1)")
         if self.flow_loss_weight <= 0:
             raise ValueError("flow_loss_weight must be positive")
+        if self.trajectory_consistency_mode not in {'none', 'td_adjacent'}:
+            raise ValueError(f"unsupported trajectory_consistency_mode: {self.trajectory_consistency_mode}")
+        if self.td_weighting_mode not in {'none', 'snr'}:
+            raise ValueError(f"unsupported td_weighting_mode: {self.td_weighting_mode}")
+        if self.td_loss_weight < 0:
+            raise ValueError("td_loss_weight must be non-negative")
         if self.prediction_target_mode not in {'item_emb', 'pref_state'}:
             raise ValueError(f"unsupported prediction_target_mode: {self.prediction_target_mode}")
         if self.pref_teacher_temperature <= 0:
@@ -313,6 +323,10 @@ class AdRec(nn.Module):
             'flow_num_steps': int(self.flow_num_steps),
             'flow_time_schedule': self.flow_time_schedule,
             'flow_loss_weight': float(self.flow_loss_weight),
+            'trajectory_consistency_mode': self.trajectory_consistency_mode,
+            'td_delta_step': int(self.td_delta_step),
+            'td_loss_weight': float(self.td_loss_weight),
+            'td_weighting_mode': self.td_weighting_mode,
             'prediction_target_mode': self.prediction_target_mode,
             'pref_teacher_topk': int(self.pref_teacher_topk),
             'pref_teacher_temperature': float(self.pref_teacher_temperature),
@@ -344,6 +358,11 @@ class AdRec(nn.Module):
             'endpoint_to_target_cos': 0.0,
             'endpoint_to_stationary_cos': 0.0,
             'x1_item_top1_acc': 0.0,
+            'td_loss': 0.0,
+            'x0_hat_high_to_target_cos': 0.0,
+            'x0_hat_low_to_target_cos': 0.0,
+            'td_teacher_to_low_cos': 0.0,
+            'td_high_low_gap': 0.0,
         }
         return source_latent, target_latent, stationary_anchor
 
@@ -357,6 +376,10 @@ class AdRec(nn.Module):
                 'flow_num_steps': int(self.flow_num_steps),
                 'flow_time_schedule': self.flow_time_schedule,
                 'flow_loss_weight': float(self.flow_loss_weight),
+                'trajectory_consistency_mode': self.trajectory_consistency_mode,
+                'td_delta_step': int(self.td_delta_step),
+                'td_loss_weight': float(self.td_loss_weight),
+                'td_weighting_mode': self.td_weighting_mode,
                 'prediction_target_mode': self.prediction_target_mode,
                 'pref_teacher_topk': int(self.pref_teacher_topk),
                 'pref_teacher_temperature': float(self.pref_teacher_temperature),
@@ -388,6 +411,11 @@ class AdRec(nn.Module):
                 'endpoint_to_target_cos': 0.0,
                 'endpoint_to_stationary_cos': 0.0,
                 'x1_item_top1_acc': 0.0,
+                'td_loss': 0.0,
+                'x0_hat_high_to_target_cos': 0.0,
+                'x0_hat_low_to_target_cos': 0.0,
+                'td_teacher_to_low_cos': 0.0,
+                'td_high_low_gap': 0.0,
             }
             return item_tag
         stationary_anchor, anchor_shift, raw_shift_norm = self._compute_stationary_components(hist_rep, item_tag, mask_seq)
@@ -402,6 +430,10 @@ class AdRec(nn.Module):
             'flow_num_steps': int(self.flow_num_steps),
             'flow_time_schedule': self.flow_time_schedule,
             'flow_loss_weight': float(self.flow_loss_weight),
+            'trajectory_consistency_mode': self.trajectory_consistency_mode,
+            'td_delta_step': int(self.td_delta_step),
+            'td_loss_weight': float(self.td_loss_weight),
+            'td_weighting_mode': self.td_weighting_mode,
             'prediction_target_mode': self.prediction_target_mode,
             'pref_teacher_topk': int(self.pref_teacher_topk),
             'pref_teacher_temperature': float(self.pref_teacher_temperature),
@@ -433,6 +465,11 @@ class AdRec(nn.Module):
             'endpoint_to_target_cos': 0.0,
             'endpoint_to_stationary_cos': 0.0,
             'x1_item_top1_acc': 0.0,
+            'td_loss': 0.0,
+            'x0_hat_high_to_target_cos': 0.0,
+            'x0_hat_low_to_target_cos': 0.0,
+            'td_teacher_to_low_cos': 0.0,
+            'td_high_low_gap': 0.0,
         }
         return target_latent
 
@@ -585,6 +622,77 @@ class AdRec(nn.Module):
         flow_t = torch.rand(mask_tag.shape, device=device, dtype=dtype) * mask_tag.to(dtype)
         flow_t_index = flow_t * float(max(self.num_timesteps - 1, 1))
         return flow_t, flow_t_index
+
+    def _reshape_timesteps_like_target(self, t, target_shape):
+        if t.dim() == 1:
+            if t.numel() == target_shape[0] * target_shape[1]:
+                return t.reshape(target_shape[0], target_shape[1])
+            if t.numel() == target_shape[0]:
+                return t.unsqueeze(-1).expand(-1, target_shape[1])
+        if t.dim() == 2 and t.shape == target_shape[:2]:
+            return t
+        raise ValueError(f"unexpected timestep shape {tuple(t.shape)} for target shape {tuple(target_shape)}")
+
+    def _apply_td_step_from_high(self, x_t_high, x0_hat_high_detached, t_high_matrix):
+        x_curr = x_t_high.detach()
+        for step_idx in range(self.td_delta_step):
+            current_t = (t_high_matrix - step_idx).clamp(min=0)
+            posterior_mean = self.q_posterior_mean_variance(x_start=x0_hat_high_detached, x_t=x_curr, t=current_t)
+            update_mask = (current_t > 0).unsqueeze(-1)
+            x_curr = torch.where(update_mask, posterior_mean, x0_hat_high_detached)
+        return x_curr
+
+    def _td_weight_tensor(self, t_low_matrix, mask_tag, dtype, device):
+        if self.td_weighting_mode == 'none':
+            return mask_tag.to(dtype)
+        alpha_bar = torch.as_tensor(self.alphas_cumprod, device=device, dtype=dtype)
+        return alpha_bar[t_low_matrix.long().clamp(min=0, max=self.num_timesteps - 1)] * mask_tag.to(dtype)
+
+    def _compute_td_consistency_loss(self, item_rep, diff_target, x_t_high, t_high, x0_hat_high, mask_seq, mask_tag):
+        zero_loss = x0_hat_high.new_zeros(())
+        if self.trajectory_consistency_mode == 'none' or self.td_loss_weight <= 0:
+            self.latest_stats.update({
+                'td_loss': 0.0,
+                'x0_hat_high_to_target_cos': 0.0,
+                'x0_hat_low_to_target_cos': 0.0,
+                'td_teacher_to_low_cos': 0.0,
+                'td_high_low_gap': 0.0,
+            })
+            return zero_loss
+
+        t_high_matrix = self._reshape_timesteps_like_target(t_high, diff_target.shape)
+        t_low_matrix = (t_high_matrix - self.td_delta_step).clamp(min=0)
+        x_t_low = self.q_sample(
+            diff_target.reshape(-1, diff_target.shape[-1]),
+            t_low_matrix.reshape(-1),
+            mask=mask_tag.reshape(-1),
+        ).reshape_as(diff_target)
+        x0_hat_low = self.net(item_rep, x_t_low, self._scale_timesteps(t_low_matrix), mask_seq, mask_tag)
+
+        with torch.no_grad():
+            x0_hat_high_detached = x0_hat_high.detach()
+            x_tdlow_teacher = self._apply_td_step_from_high(x_t_high, x0_hat_high_detached, t_high_matrix)
+            x0_tdlow_from_high = self.net(item_rep, x_tdlow_teacher, self._scale_timesteps(t_low_matrix), mask_seq, mask_tag).detach()
+
+        td_weights = self._td_weight_tensor(t_low_matrix, mask_tag, x0_hat_high.dtype, x0_hat_high.device)
+        td_weights = td_weights / td_weights.sum(1, keepdim=True).clamp_min(1e-6)
+        td_loss = (F.mse_loss(x0_hat_low, x0_tdlow_from_high, reduction='none') * td_weights.unsqueeze(-1)).sum(1).mean()
+        td_loss = td_loss * self.td_loss_weight
+
+        valid_mask = mask_tag > 0
+        valid_mask_float = valid_mask.float()
+        x0_high_norm = F.normalize(x0_hat_high, dim=-1)
+        x0_low_norm = F.normalize(x0_hat_low, dim=-1)
+        td_teacher_norm = F.normalize(x0_tdlow_from_high, dim=-1)
+        diff_target_norm = F.normalize(diff_target, dim=-1)
+        self.latest_stats.update({
+            'td_loss': float(td_loss.detach().item()),
+            'x0_hat_high_to_target_cos': self._masked_mean((x0_high_norm * diff_target_norm).sum(dim=-1), valid_mask_float),
+            'x0_hat_low_to_target_cos': self._masked_mean((x0_low_norm * diff_target_norm).sum(dim=-1), valid_mask_float),
+            'td_teacher_to_low_cos': self._masked_mean((td_teacher_norm * x0_low_norm).sum(dim=-1), valid_mask_float),
+            'td_high_low_gap': self._masked_mean((x0_hat_high - x0_hat_low).norm(dim=-1), valid_mask_float),
+        })
+        return td_loss
 
     def _flow_step_schedule(self, device, dtype):
         if self.flow_time_schedule == 'linear':
@@ -858,6 +966,15 @@ class AdRec(nn.Module):
             mask = torch.rand([mask_seq.shape[0],1,1],device=item_rep.device) > 0.7
             item_rep = torch.where(mask,torch.zeros_like(item_rep),item_rep)
         denoised_seq = self.net(item_rep, x_t, self._scale_timesteps(t), mask_seq,mask_tag)  ##output predict
+        td_loss = self._compute_td_consistency_loss(
+            item_rep=item_rep,
+            diff_target=diff_target,
+            x_t_high=x_t,
+            t_high=t,
+            x0_hat_high=denoised_seq,
+            mask_seq=mask_seq,
+            mask_tag=mask_tag,
+        )
         png_payload = None
         if self.use_positive_negative_guidance and item_embedding_weight is not None:
             negative_condition, negative_stats = self._build_confusing_negative_condition(
@@ -884,7 +1001,7 @@ class AdRec(nn.Module):
         )
         # print(denoised_seq.shape,item_tag.shape,mask_tag.shape)
         losses = F.mse_loss(denoised_seq,diff_target, reduction='none')* (mask_tag / mask_tag.sum(1,keepdim=True)).unsqueeze(-1)
-        losses = losses.sum(1).mean()
+        losses = losses.sum(1).mean() + td_loss
         return denoised_seq, losses, t, png_payload
 
 
