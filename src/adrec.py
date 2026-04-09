@@ -209,17 +209,33 @@ class AdRec(nn.Module):
         self.negative_condition_topk = max(int(getattr(args, 'negative_condition_topk', 10)), 1)
         self.png_guidance_scale = float(getattr(args, 'png_guidance_scale', 0.0))
         self.negative_condition_chunk_size = max(int(getattr(args, 'item_consistency_chunk_size', 2048)), 1)
-        self.prediction_target_mode = getattr(args, 'prediction_target_mode', 'pref_state')
+        self.prediction_target_mode = getattr(args, 'prediction_target_mode', 'item_emb')
         self.pref_teacher_topk = max(int(getattr(args, 'pref_teacher_topk', 20)), 1)
         self.pref_teacher_temperature = float(getattr(args, 'pref_teacher_temperature', 1.0))
         self.pref_mix_topk_alpha = float(getattr(args, 'pref_mix_topk_alpha', 0.30))
         self.pref_mix_stationary_beta = float(getattr(args, 'pref_mix_stationary_beta', 0.20))
+        self.generative_process_mode = getattr(args, 'generative_process_mode', 'flow_matching')
+        self.flow_source_mode = getattr(args, 'flow_source_mode', 'stationary_anchor')
+        self.flow_source_hist_blend_rho = float(getattr(args, 'flow_source_hist_blend_rho', 0.0))
+        self.flow_num_steps = max(int(getattr(args, 'flow_num_steps', self.diffusion_steps)), 1)
+        self.flow_time_schedule = getattr(args, 'flow_time_schedule', 'linear')
+        self.flow_loss_weight = float(getattr(args, 'flow_loss_weight', 1.0))
         self.current_epoch = 0
         self.current_stationary_anchor_scale = 0.0
         self.latest_stats = {}
         self.set_curriculum_epoch(0)
         if self.negative_condition_source not in {'confusing_topk_from_main_ce'}:
             raise ValueError(f"unsupported negative_condition_source: {self.negative_condition_source}")
+        if self.generative_process_mode not in {'diffusion', 'flow_matching'}:
+            raise ValueError(f"unsupported generative_process_mode: {self.generative_process_mode}")
+        if self.flow_source_mode not in {'stationary_anchor', 'stationary_anchor_blend_last'}:
+            raise ValueError(f"unsupported flow_source_mode: {self.flow_source_mode}")
+        if self.flow_time_schedule not in {'linear'}:
+            raise ValueError(f"unsupported flow_time_schedule: {self.flow_time_schedule}")
+        if not (0.0 <= self.flow_source_hist_blend_rho < 1.0):
+            raise ValueError("flow_source_hist_blend_rho must be in [0, 1)")
+        if self.flow_loss_weight <= 0:
+            raise ValueError("flow_loss_weight must be positive")
         if self.prediction_target_mode not in {'item_emb', 'pref_state'}:
             raise ValueError(f"unsupported prediction_target_mode: {self.prediction_target_mode}")
         if self.pref_teacher_temperature <= 0:
@@ -255,14 +271,20 @@ class AdRec(nn.Module):
             'stationary_shift_norm_cap': float(self.stationary_shift_norm_cap),
         })
 
+    def _normalize_with_mask(self, tensor, mask):
+        return F.normalize(tensor, dim=-1) * mask.unsqueeze(-1).to(tensor.dtype)
+
     def _masked_mean(self, tensor, mask):
         mask = mask.float()
         denom = mask.sum().clamp_min(1.0)
         return float((tensor * mask).sum().detach().item() / denom.detach().item())
 
-    def _compute_stationary_components(self, hist_rep, item_tag, mask_seq):
+    def _build_stationary_anchor(self, hist_rep, mask_seq):
         anchor_denom = mask_seq.sum(1, keepdim=True).clamp_min(1.0).unsqueeze(-1)
-        stationary_anchor = (hist_rep * mask_seq.unsqueeze(-1)).sum(1, keepdim=True) / anchor_denom
+        return (hist_rep * mask_seq.unsqueeze(-1)).sum(1, keepdim=True) / anchor_denom
+
+    def _compute_stationary_components(self, hist_rep, item_tag, mask_seq):
+        stationary_anchor = self._build_stationary_anchor(hist_rep, mask_seq)
         anchor_shift = stationary_anchor - item_tag
         raw_shift_norm = anchor_shift.norm(dim=-1)
         if self.stationary_shift_norm_cap and self.stationary_shift_norm_cap > 0:
@@ -270,10 +292,71 @@ class AdRec(nn.Module):
             anchor_shift = anchor_shift * (capped_shift_norm / raw_shift_norm.clamp_min(1e-6)).unsqueeze(-1)
         return stationary_anchor, anchor_shift, raw_shift_norm
 
+    def _build_flow_source_target(self, hist_rep, item_tag, mask_seq, mask_tag):
+        stationary_anchor = self._build_stationary_anchor(hist_rep, mask_seq)
+        hist_last = hist_rep[:, -1:, :]
+        if self.flow_source_mode == 'stationary_anchor':
+            source_latent = stationary_anchor
+        else:
+            source_latent = (1.0 - self.flow_source_hist_blend_rho) * stationary_anchor + self.flow_source_hist_blend_rho * hist_last
+        source_latent = self._normalize_with_mask(source_latent.expand_as(item_tag), mask_tag)
+        target_latent = self._normalize_with_mask(item_tag, mask_tag)
+        valid_mask = mask_tag.float()
+        source_to_target_cos = (source_latent * target_latent).sum(dim=-1)
+        source_norm = source_latent.norm(dim=-1)
+        target_norm = target_latent.norm(dim=-1)
+        stationary_anchor_norm = stationary_anchor.norm(dim=-1)
+        self.latest_stats = {
+            'generative_process_mode': self.generative_process_mode,
+            'flow_source_mode': self.flow_source_mode,
+            'flow_source_hist_blend_rho': float(self.flow_source_hist_blend_rho),
+            'flow_num_steps': int(self.flow_num_steps),
+            'flow_time_schedule': self.flow_time_schedule,
+            'flow_loss_weight': float(self.flow_loss_weight),
+            'prediction_target_mode': self.prediction_target_mode,
+            'pref_teacher_topk': int(self.pref_teacher_topk),
+            'pref_teacher_temperature': float(self.pref_teacher_temperature),
+            'pref_mix_topk_alpha': float(self.pref_mix_topk_alpha),
+            'pref_mix_stationary_beta': float(self.pref_mix_stationary_beta),
+            'stationary_latent_mode': self.stationary_latent_mode,
+            'stationary_anchor_scale': float(self.stationary_anchor_scale),
+            'stationary_anchor_max_scale': float(self.stationary_anchor_max_scale),
+            'stationary_effective_anchor_scale': float(self.current_stationary_anchor_scale),
+            'stationary_shift_norm_cap': float(self.stationary_shift_norm_cap),
+            'stationary_anchor_norm_mean': self._masked_mean(stationary_anchor_norm.expand_as(mask_tag), valid_mask),
+            'stationary_anchor_norm_std': float(stationary_anchor_norm.std(unbiased=False).detach().item()),
+            'stationary_raw_shift_norm_mean': 0.0,
+            'stationary_raw_shift_norm_std': 0.0,
+            'stationary_target_shift_norm_mean': 0.0,
+            'stationary_target_shift_norm_std': 0.0,
+            'pref_teacher_target_rank_in_topk': 0.0,
+            'pref_teacher_entropy': 0.0,
+            'pref_teacher_norm': 0.0,
+            'pref_target_shift_norm': 0.0,
+            'z_pref_hat_to_target_cos': 0.0,
+            'z_pref_hat_to_stationary_cos': 0.0,
+            'x0_item_top1_acc': 0.0,
+            'source_to_target_cos': self._masked_mean(source_to_target_cos, valid_mask),
+            'source_norm': self._masked_mean(source_norm, valid_mask),
+            'flow_target_norm': self._masked_mean(target_norm, valid_mask),
+            'velocity_target_norm': 0.0,
+            'velocity_pred_norm': 0.0,
+            'endpoint_to_target_cos': 0.0,
+            'endpoint_to_stationary_cos': 0.0,
+            'x1_item_top1_acc': 0.0,
+        }
+        return source_latent, target_latent, stationary_anchor
+
     def build_stationary_target(self, hist_rep, item_tag, mask_seq, mask_tag):
         if self.stationary_latent_mode == 'none':
             valid_mask = mask_tag.float()
             self.latest_stats = {
+                'generative_process_mode': self.generative_process_mode,
+                'flow_source_mode': self.flow_source_mode,
+                'flow_source_hist_blend_rho': float(self.flow_source_hist_blend_rho),
+                'flow_num_steps': int(self.flow_num_steps),
+                'flow_time_schedule': self.flow_time_schedule,
+                'flow_loss_weight': float(self.flow_loss_weight),
                 'prediction_target_mode': self.prediction_target_mode,
                 'pref_teacher_topk': int(self.pref_teacher_topk),
                 'pref_teacher_temperature': float(self.pref_teacher_temperature),
@@ -297,6 +380,14 @@ class AdRec(nn.Module):
                 'z_pref_hat_to_target_cos': 0.0,
                 'z_pref_hat_to_stationary_cos': 0.0,
                 'x0_item_top1_acc': 0.0,
+                'source_to_target_cos': 0.0,
+                'source_norm': 0.0,
+                'flow_target_norm': 0.0,
+                'velocity_target_norm': 0.0,
+                'velocity_pred_norm': 0.0,
+                'endpoint_to_target_cos': 0.0,
+                'endpoint_to_stationary_cos': 0.0,
+                'x1_item_top1_acc': 0.0,
             }
             return item_tag
         stationary_anchor, anchor_shift, raw_shift_norm = self._compute_stationary_components(hist_rep, item_tag, mask_seq)
@@ -305,6 +396,12 @@ class AdRec(nn.Module):
         anchor_norm = stationary_anchor.norm(dim=-1)
         shift_norm = (target_latent - item_tag).norm(dim=-1)
         self.latest_stats = {
+            'generative_process_mode': self.generative_process_mode,
+            'flow_source_mode': self.flow_source_mode,
+            'flow_source_hist_blend_rho': float(self.flow_source_hist_blend_rho),
+            'flow_num_steps': int(self.flow_num_steps),
+            'flow_time_schedule': self.flow_time_schedule,
+            'flow_loss_weight': float(self.flow_loss_weight),
             'prediction_target_mode': self.prediction_target_mode,
             'pref_teacher_topk': int(self.pref_teacher_topk),
             'pref_teacher_temperature': float(self.pref_teacher_temperature),
@@ -328,6 +425,14 @@ class AdRec(nn.Module):
             'z_pref_hat_to_target_cos': 0.0,
             'z_pref_hat_to_stationary_cos': 0.0,
             'x0_item_top1_acc': 0.0,
+            'source_to_target_cos': 0.0,
+            'source_norm': 0.0,
+            'flow_target_norm': 0.0,
+            'velocity_target_norm': 0.0,
+            'velocity_pred_norm': 0.0,
+            'endpoint_to_target_cos': 0.0,
+            'endpoint_to_stationary_cos': 0.0,
+            'x1_item_top1_acc': 0.0,
         }
         return target_latent
 
@@ -447,6 +552,44 @@ class AdRec(nn.Module):
             'z_pref_hat_to_stationary_cos': self._masked_mean(stationary_cos, valid_mask_float),
             'x0_item_top1_acc': float(self._compute_x0_item_top1_acc(denoised_seq, labels, item_embedding_weight, valid_mask)),
         })
+
+    def _update_flow_stats(self, endpoint_seq, velocity_pred, velocity_target, item_tag, stationary_anchor, mask_tag, item_embedding_weight=None, labels=None):
+        valid_mask = mask_tag > 0
+        if not valid_mask.any():
+            self.latest_stats.update({
+                'velocity_target_norm': 0.0,
+                'velocity_pred_norm': 0.0,
+                'endpoint_to_target_cos': 0.0,
+                'endpoint_to_stationary_cos': 0.0,
+                'x1_item_top1_acc': 0.0,
+            })
+            return
+        valid_mask_float = valid_mask.float()
+        endpoint_norm = F.normalize(endpoint_seq, dim=-1)
+        target_norm = F.normalize(item_tag, dim=-1)
+        stationary_norm = F.normalize(stationary_anchor.expand_as(endpoint_seq), dim=-1)
+        endpoint_to_target_cos = (endpoint_norm * target_norm).sum(dim=-1)
+        endpoint_to_stationary_cos = (endpoint_norm * stationary_norm).sum(dim=-1)
+        self.latest_stats.update({
+            'velocity_target_norm': self._masked_mean(velocity_target.norm(dim=-1), valid_mask_float),
+            'velocity_pred_norm': self._masked_mean(velocity_pred.norm(dim=-1), valid_mask_float),
+            'endpoint_to_target_cos': self._masked_mean(endpoint_to_target_cos, valid_mask_float),
+            'endpoint_to_stationary_cos': self._masked_mean(endpoint_to_stationary_cos, valid_mask_float),
+            'x1_item_top1_acc': float(self._compute_x0_item_top1_acc(endpoint_seq, labels, item_embedding_weight, valid_mask)),
+            'z_pref_hat_to_target_cos': self._masked_mean(endpoint_to_target_cos, valid_mask_float),
+            'z_pref_hat_to_stationary_cos': self._masked_mean(endpoint_to_stationary_cos, valid_mask_float),
+            'x0_item_top1_acc': float(self._compute_x0_item_top1_acc(endpoint_seq, labels, item_embedding_weight, valid_mask)),
+        })
+
+    def _sample_flow_times(self, mask_tag, device, dtype):
+        flow_t = torch.rand(mask_tag.shape, device=device, dtype=dtype) * mask_tag.to(dtype)
+        flow_t_index = flow_t * float(max(self.num_timesteps - 1, 1))
+        return flow_t, flow_t_index
+
+    def _flow_step_schedule(self, device, dtype):
+        if self.flow_time_schedule == 'linear':
+            return torch.linspace(0.0, 1.0, self.flow_num_steps + 1, device=device, dtype=dtype)
+        raise ValueError(f"unsupported flow_time_schedule: {self.flow_time_schedule}")
 
     def get_latest_stats(self):
         return dict(self.latest_stats)
@@ -617,6 +760,29 @@ class AdRec(nn.Module):
 
     def denoise_sample(self, seq, tgt, mask_seq, mask_tag, item_embedding_weight=None, labels=None):
         seq = self.ag_encoder(seq, mask_seq)
+        if self.generative_process_mode == 'flow_matching':
+            source_latent, target_latent, stationary_anchor = self._build_flow_source_target(seq, tgt, mask_seq, mask_tag)
+            flow_times = self._flow_step_schedule(seq.device, seq.dtype)
+            x_curr = source_latent
+            last_velocity = torch.zeros_like(x_curr)
+            for step_index in range(self.flow_num_steps):
+                t_value = flow_times[step_index]
+                dt_value = flow_times[step_index + 1] - flow_times[step_index]
+                t_tensor = torch.full(mask_tag.shape, float(t_value.item() * max(self.num_timesteps - 1, 1)), device=seq.device, dtype=seq.dtype)
+                velocity = self.net(seq, x_curr, self._scale_timesteps(t_tensor), mask_seq, mask_tag)
+                x_curr = (x_curr + dt_value * velocity) * mask_tag.unsqueeze(-1)
+                last_velocity = velocity
+            self._update_flow_stats(
+                endpoint_seq=x_curr,
+                velocity_pred=last_velocity,
+                velocity_target=target_latent - source_latent,
+                item_tag=target_latent,
+                stationary_anchor=stationary_anchor,
+                mask_tag=mask_tag,
+                item_embedding_weight=item_embedding_weight,
+                labels=labels,
+            )
+            return x_curr
         item_target = tgt
         tgt, stationary_anchor = self.build_diffusion_target(
             seq,
@@ -656,6 +822,29 @@ class AdRec(nn.Module):
         return x_t,t
     def forward(self, item_rep, item_tag, mask_seq,mask_tag, item_embedding_weight=None, labels=None):
         item_rep = self.ag_encoder(item_rep, mask_seq)
+        if self.generative_process_mode == 'flow_matching':
+            source_latent, target_latent, stationary_anchor = self._build_flow_source_target(item_rep, item_tag, mask_seq, mask_tag)
+            flow_t, flow_t_index = self._sample_flow_times(mask_tag, item_rep.device, item_rep.dtype)
+            x_t = ((1.0 - flow_t).unsqueeze(-1) * source_latent + flow_t.unsqueeze(-1) * target_latent) * mask_tag.unsqueeze(-1)
+            velocity_target = (target_latent - source_latent) * mask_tag.unsqueeze(-1)
+            velocity_pred = self.net(item_rep, x_t, self._scale_timesteps(flow_t_index), mask_seq,mask_tag)
+            endpoint_seq = x_t + (1.0 - flow_t).unsqueeze(-1) * velocity_pred
+            endpoint_seq = endpoint_seq * mask_tag.unsqueeze(-1)
+            self._update_flow_stats(
+                endpoint_seq=endpoint_seq,
+                velocity_pred=velocity_pred,
+                velocity_target=velocity_target,
+                item_tag=target_latent,
+                stationary_anchor=stationary_anchor,
+                mask_tag=mask_tag,
+                item_embedding_weight=item_embedding_weight,
+                labels=labels,
+            )
+            flow_weights = (mask_tag / mask_tag.sum(1, keepdim=True).clamp_min(1.0)).unsqueeze(-1)
+            losses = F.mse_loss(velocity_pred, velocity_target, reduction='none') * flow_weights
+            losses = losses.sum(1).mean() * self.flow_loss_weight
+            rounded_t = flow_t_index.round().long().clamp(min=0, max=self.num_timesteps - 1)
+            return endpoint_seq, losses, rounded_t, None
         diff_target, stationary_anchor = self.build_diffusion_target(
             item_rep,
             item_tag,

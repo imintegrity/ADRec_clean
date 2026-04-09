@@ -60,7 +60,7 @@ ffn_adapter_num_stages: 4
 ffn_adapter_ctx_num_stages: 2
 ffn_adapter_bottleneck_ratio: 0.25
 lambda_item: 0.2
-item_alignment_mode: topk_kd
+item_alignment_mode: ce
 item_alignment_temperature: 0.07
 item_alignment_topk: 50
 item_alignment_kd_temperature: 1.0
@@ -71,23 +71,29 @@ item_alignment_negative_source: inbatch_then_random
 item_consistency_temperature: 0.07
 item_consistency_snr_power: 1.0
 item_consistency_chunk_size: 2048
-item_consistency_warmup_epochs: 5
-item_consistency_ramp_epochs: 15
+item_consistency_warmup_epochs: 0
+item_consistency_ramp_epochs: 0
 item_consistency_max_weight: 0.2
 stationary_anchor_scale: 0.24
 stationary_anchor_max_scale: 0.24
 stationary_shift_norm_cap: 0.5
-prediction_target_mode: pref_state
+prediction_target_mode: item_emb
 pref_teacher_topk: 20
 pref_teacher_temperature: 1.0
 pref_mix_topk_alpha: 0.30
 pref_mix_stationary_beta: 0.20
-use_positive_negative_guidance: true
+generative_process_mode: flow_matching
+flow_source_mode: stationary_anchor
+flow_source_hist_blend_rho: 0.0
+flow_num_steps: 32
+flow_time_schedule: linear
+flow_loss_weight: 1.0
+use_positive_negative_guidance: false
 negative_condition_source: confusing_topk_from_main_ce
 negative_condition_topk: 10
-png_guidance_scale: 0.5
+png_guidance_scale: 0.0
 gal_margin: 0.1
-gal_weight: 0.05
+gal_weight: 0.0
 split_onebyone: false  # Split sequence one by one
 noise_schedule: trunc_lin
 beta_a: 0.3 #beta_schedule

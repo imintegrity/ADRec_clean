@@ -64,11 +64,17 @@ class Att_Diffuse_model(nn.Module):
         self.png_guidance_scale = float(getattr(args, 'png_guidance_scale', 0.0))
         self.gal_margin = float(getattr(args, 'gal_margin', 0.1))
         self.gal_weight = float(getattr(args, 'gal_weight', 0.05))
-        self.prediction_target_mode = getattr(args, 'prediction_target_mode', 'pref_state')
+        self.prediction_target_mode = getattr(args, 'prediction_target_mode', 'item_emb')
         self.pref_teacher_topk = max(int(getattr(args, 'pref_teacher_topk', 20)), 1)
         self.pref_teacher_temperature = float(getattr(args, 'pref_teacher_temperature', 1.0))
         self.pref_mix_topk_alpha = float(getattr(args, 'pref_mix_topk_alpha', 0.30))
         self.pref_mix_stationary_beta = float(getattr(args, 'pref_mix_stationary_beta', 0.20))
+        self.generative_process_mode = getattr(args, 'generative_process_mode', 'flow_matching')
+        self.flow_source_mode = getattr(args, 'flow_source_mode', 'stationary_anchor')
+        self.flow_source_hist_blend_rho = float(getattr(args, 'flow_source_hist_blend_rho', 0.0))
+        self.flow_num_steps = max(int(getattr(args, 'flow_num_steps', getattr(args, 'diffusion_steps', 32))), 1)
+        self.flow_time_schedule = getattr(args, 'flow_time_schedule', 'linear')
+        self.flow_loss_weight = float(getattr(args, 'flow_loss_weight', 1.0))
         if self.item_alignment_mode not in {'ce', 'topk_kd', 'pref_ratio', 'cosine_margin_ce'}:
             raise ValueError(f"unsupported item_alignment_mode: {self.item_alignment_mode}")
         if self.item_alignment_teacher_source not in {'main_ce_head'}:
@@ -227,6 +233,12 @@ class Att_Diffuse_model(nn.Module):
             'pref_teacher_temperature': float(self.pref_teacher_temperature),
             'pref_mix_topk_alpha': float(self.pref_mix_topk_alpha),
             'pref_mix_stationary_beta': float(self.pref_mix_stationary_beta),
+            'generative_process_mode': self.generative_process_mode,
+            'flow_source_mode': self.flow_source_mode,
+            'flow_source_hist_blend_rho': float(self.flow_source_hist_blend_rho),
+            'flow_num_steps': int(self.flow_num_steps),
+            'flow_time_schedule': self.flow_time_schedule,
+            'flow_loss_weight': float(self.flow_loss_weight),
         }
 
     def _compute_branch_top1_acc(self, branch_seq, labels):

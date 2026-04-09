@@ -139,6 +139,12 @@ def build_efficiency_report(model_joint, args):
         'pref_teacher_temperature': getattr(args, 'pref_teacher_temperature', None),
         'pref_mix_topk_alpha': getattr(args, 'pref_mix_topk_alpha', None),
         'pref_mix_stationary_beta': getattr(args, 'pref_mix_stationary_beta', None),
+        'generative_process_mode': getattr(args, 'generative_process_mode', None),
+        'flow_source_mode': getattr(args, 'flow_source_mode', None),
+        'flow_source_hist_blend_rho': getattr(args, 'flow_source_hist_blend_rho', None),
+        'flow_num_steps': getattr(args, 'flow_num_steps', None),
+        'flow_time_schedule': getattr(args, 'flow_time_schedule', None),
+        'flow_loss_weight': getattr(args, 'flow_loss_weight', None),
         'use_positive_negative_guidance': getattr(args, 'use_positive_negative_guidance', None),
         'negative_condition_source': getattr(args, 'negative_condition_source', None),
         'negative_condition_topk': getattr(args, 'negative_condition_topk', None),
@@ -414,6 +420,9 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
     logger.info('Test------------------------------------------------------')
     print(test_metrics_dict_mean)
     logger.info(test_metrics_dict_mean)
+    best_test_gap = float(best_metrics_dict.get('Best_NDCG@20', 0.0) - test_metrics_dict_mean.get('NDCG@20', 0.0))
+    print(f'best/test gap: {best_test_gap:.4f}')
+    logger.info(f'best/test gap: {best_test_gap:.4f}')
     print('Best Eval---------------------------------------------------------')
     logger.info('Best Eval---------------------------------------------------------')
     print(best_metrics_dict)
@@ -431,6 +440,7 @@ def model_train(model_joint,tra_data_loader, val_data_loader, test_data_loader, 
     if scoring_latencies:
         efficiency_report['test_scoring_avg_batch_latency_sec'] = float(np.mean(scoring_latencies))
         efficiency_report['test_scoring_p95_batch_latency_sec'] = float(np.percentile(scoring_latencies, 95))
+    efficiency_report['best_test_gap'] = best_test_gap
     efficiency_report['train_wall_clock_sec'] = float(time.perf_counter() - train_wall_clock_start)
     if efficiency_report['epoch_efficiency']:
         efficiency_report['avg_epoch_time_sec'] = float(np.mean([entry['epoch_time_sec'] for entry in efficiency_report['epoch_efficiency']]))
