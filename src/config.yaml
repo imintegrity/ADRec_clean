@@ -88,10 +88,15 @@ flow_source_hist_blend_rho: 0.0
 flow_num_steps: 32
 flow_time_schedule: linear
 flow_loss_weight: 1.0
-trajectory_consistency_mode: td_adjacent
+trajectory_consistency_mode: none
 td_delta_step: 1
 td_loss_weight: 0.05
 td_weighting_mode: snr
+self_condition_mode: x0_prev
+self_condition_train_prob: 0.5
+self_condition_dropout_prob: 0.1
+self_condition_noise_std: 0.05
+self_condition_fusion_mode: gated_add
 use_positive_negative_guidance: false
 negative_condition_source: confusing_topk_from_main_ce
 negative_condition_topk: 10

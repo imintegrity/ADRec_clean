@@ -75,10 +75,15 @@ class Att_Diffuse_model(nn.Module):
         self.flow_num_steps = max(int(getattr(args, 'flow_num_steps', getattr(args, 'diffusion_steps', 32))), 1)
         self.flow_time_schedule = getattr(args, 'flow_time_schedule', 'linear')
         self.flow_loss_weight = float(getattr(args, 'flow_loss_weight', 1.0))
-        self.trajectory_consistency_mode = getattr(args, 'trajectory_consistency_mode', 'td_adjacent')
+        self.trajectory_consistency_mode = getattr(args, 'trajectory_consistency_mode', 'none')
         self.td_delta_step = max(int(getattr(args, 'td_delta_step', 1)), 1)
         self.td_loss_weight = float(getattr(args, 'td_loss_weight', 0.05))
         self.td_weighting_mode = getattr(args, 'td_weighting_mode', 'snr')
+        self.self_condition_mode = getattr(args, 'self_condition_mode', 'x0_prev')
+        self.self_condition_train_prob = float(getattr(args, 'self_condition_train_prob', 0.5))
+        self.self_condition_dropout_prob = float(getattr(args, 'self_condition_dropout_prob', 0.1))
+        self.self_condition_noise_std = float(getattr(args, 'self_condition_noise_std', 0.05))
+        self.self_condition_fusion_mode = getattr(args, 'self_condition_fusion_mode', 'gated_add')
         if self.item_alignment_mode not in {'ce', 'topk_kd', 'pref_ratio', 'cosine_margin_ce'}:
             raise ValueError(f"unsupported item_alignment_mode: {self.item_alignment_mode}")
         if self.item_alignment_teacher_source not in {'main_ce_head'}:
@@ -247,6 +252,11 @@ class Att_Diffuse_model(nn.Module):
             'td_delta_step': int(self.td_delta_step),
             'td_loss_weight': float(self.td_loss_weight),
             'td_weighting_mode': self.td_weighting_mode,
+            'self_condition_mode': self.self_condition_mode,
+            'self_condition_train_prob': float(self.self_condition_train_prob),
+            'self_condition_dropout_prob': float(self.self_condition_dropout_prob),
+            'self_condition_noise_std': float(self.self_condition_noise_std),
+            'self_condition_fusion_mode': self.self_condition_fusion_mode,
         }
 
     def _compute_branch_top1_acc(self, branch_seq, labels):

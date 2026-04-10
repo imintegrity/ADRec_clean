@@ -16,6 +16,8 @@ class DenoisedModel(nn.Module):
         self.decoder_type = args.dif_decoder
         self.diffusion_steps = args.diffusion_steps
         self.rescale_timesteps = args.rescale_timesteps
+        self.self_condition_mode = getattr(args, 'self_condition_mode', 'none')
+        self.self_condition_fusion_mode = getattr(args, 'self_condition_fusion_mode', 'gated_add')
         if args.dif_decoder =='mlp':
             self.decoder = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size * 4),
                                         SiLU(),
@@ -71,8 +73,14 @@ class DenoisedModel(nn.Module):
                                         SiLU(),
                                         nn.Linear(self.hidden_size * 4, self.hidden_size)
                                         )
+        self.self_cond_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        self.self_cond_gate = nn.Linear(self.hidden_size * 2, self.hidden_size)
 
         self.lambda_uncertainty = args.lambda_uncertainty
+        if self.self_condition_mode not in {'none', 'x0_prev'}:
+            raise ValueError(f"unsupported self_condition_mode: {self.self_condition_mode}")
+        if self.self_condition_fusion_mode not in {'gated_add'}:
+            raise ValueError(f"unsupported self_condition_fusion_mode: {self.self_condition_fusion_mode}")
 
 
     def timestep_embedding(self, timesteps, dim, max_period=10000):
@@ -94,14 +102,14 @@ class DenoisedModel(nn.Module):
             embedding = th.cat([embedding, th.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
-    def forward_cfg(self,c, x, t, mask_seq,mask_tgt,cfg_scale=1.0):
-        cond_eps = self.forward(c,x, t,mask_seq,mask_tgt)
-        uncond_eps = self.forward(c,x, t,mask_seq,mask_tgt,condition=False)
+    def forward_cfg(self,c, x, t, mask_seq,mask_tgt,cfg_scale=1.0, self_cond=None):
+        cond_eps = self.forward(c,x, t,mask_seq,mask_tgt, self_cond=self_cond)
+        uncond_eps = self.forward(c,x, t,mask_seq,mask_tgt,condition=False, self_cond=self_cond)
         eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         return eps
 
 
-    def forward(self, rep_item, x_t, t, mask_seq,mask_tgt,condition=True):
+    def forward(self, rep_item, x_t, t, mask_seq,mask_tgt,condition=True, self_cond=None):
         if condition is not True:  #CFG
             rep_item = torch.zeros_like(rep_item)
             # mask = torch.rand_like(mask_seq) > 0.5
@@ -118,6 +126,14 @@ class DenoisedModel(nn.Module):
 
         rep_diffu = rep_item + lambda_uncertainty * (x_t + time_emb)
         state_input = x_t + time_emb
+        if self.self_condition_mode == 'x0_prev':
+            if self_cond is None:
+                self_cond = torch.zeros_like(x_t)
+            sc_proj = self.self_cond_proj(self_cond)
+            sc_gate = torch.sigmoid(self.self_cond_gate(torch.cat([time_emb, sc_proj], dim=-1)))
+            sc_fused = sc_gate * sc_proj * mask_tgt.unsqueeze(-1).to(sc_proj.dtype)
+            rep_diffu = rep_diffu + sc_fused
+            state_input = state_input + sc_fused
 
         if self.decoder_type == 'mlp':
             rep_diffu = self.decoder(rep_diffu)
@@ -220,10 +236,15 @@ class AdRec(nn.Module):
         self.flow_num_steps = max(int(getattr(args, 'flow_num_steps', self.diffusion_steps)), 1)
         self.flow_time_schedule = getattr(args, 'flow_time_schedule', 'linear')
         self.flow_loss_weight = float(getattr(args, 'flow_loss_weight', 1.0))
-        self.trajectory_consistency_mode = getattr(args, 'trajectory_consistency_mode', 'td_adjacent')
+        self.trajectory_consistency_mode = getattr(args, 'trajectory_consistency_mode', 'none')
         self.td_delta_step = max(int(getattr(args, 'td_delta_step', 1)), 1)
         self.td_loss_weight = float(getattr(args, 'td_loss_weight', 0.05))
         self.td_weighting_mode = getattr(args, 'td_weighting_mode', 'snr')
+        self.self_condition_mode = getattr(args, 'self_condition_mode', 'x0_prev')
+        self.self_condition_train_prob = float(getattr(args, 'self_condition_train_prob', 0.5))
+        self.self_condition_dropout_prob = float(getattr(args, 'self_condition_dropout_prob', 0.1))
+        self.self_condition_noise_std = float(getattr(args, 'self_condition_noise_std', 0.05))
+        self.self_condition_fusion_mode = getattr(args, 'self_condition_fusion_mode', 'gated_add')
         self.current_epoch = 0
         self.current_stationary_anchor_scale = 0.0
         self.latest_stats = {}
@@ -246,6 +267,16 @@ class AdRec(nn.Module):
             raise ValueError(f"unsupported td_weighting_mode: {self.td_weighting_mode}")
         if self.td_loss_weight < 0:
             raise ValueError("td_loss_weight must be non-negative")
+        if self.self_condition_mode not in {'none', 'x0_prev'}:
+            raise ValueError(f"unsupported self_condition_mode: {self.self_condition_mode}")
+        if not (0.0 <= self.self_condition_train_prob <= 1.0):
+            raise ValueError("self_condition_train_prob must be in [0, 1]")
+        if not (0.0 <= self.self_condition_dropout_prob < 1.0):
+            raise ValueError("self_condition_dropout_prob must be in [0, 1)")
+        if self.self_condition_noise_std < 0:
+            raise ValueError("self_condition_noise_std must be non-negative")
+        if self.self_condition_fusion_mode not in {'gated_add'}:
+            raise ValueError(f"unsupported self_condition_fusion_mode: {self.self_condition_fusion_mode}")
         if self.prediction_target_mode not in {'item_emb', 'pref_state'}:
             raise ValueError(f"unsupported prediction_target_mode: {self.prediction_target_mode}")
         if self.pref_teacher_temperature <= 0:
@@ -327,6 +358,11 @@ class AdRec(nn.Module):
             'td_delta_step': int(self.td_delta_step),
             'td_loss_weight': float(self.td_loss_weight),
             'td_weighting_mode': self.td_weighting_mode,
+            'self_condition_mode': self.self_condition_mode,
+            'self_condition_train_prob': float(self.self_condition_train_prob),
+            'self_condition_dropout_prob': float(self.self_condition_dropout_prob),
+            'self_condition_noise_std': float(self.self_condition_noise_std),
+            'self_condition_fusion_mode': self.self_condition_fusion_mode,
             'prediction_target_mode': self.prediction_target_mode,
             'pref_teacher_topk': int(self.pref_teacher_topk),
             'pref_teacher_temperature': float(self.pref_teacher_temperature),
@@ -363,6 +399,13 @@ class AdRec(nn.Module):
             'x0_hat_low_to_target_cos': 0.0,
             'td_teacher_to_low_cos': 0.0,
             'td_high_low_gap': 0.0,
+            'self_condition_enabled_ratio': 0.0,
+            'self_cond_norm': 0.0,
+            'self_cond_to_target_cos': 0.0,
+            'x0_hat_base_to_target_cos': 0.0,
+            'x0_hat_sc_to_target_cos': 0.0,
+            'x0_hat_base_to_stationary_cos': 0.0,
+            'x0_hat_sc_to_stationary_cos': 0.0,
         }
         return source_latent, target_latent, stationary_anchor
 
@@ -380,6 +423,11 @@ class AdRec(nn.Module):
                 'td_delta_step': int(self.td_delta_step),
                 'td_loss_weight': float(self.td_loss_weight),
                 'td_weighting_mode': self.td_weighting_mode,
+                'self_condition_mode': self.self_condition_mode,
+                'self_condition_train_prob': float(self.self_condition_train_prob),
+                'self_condition_dropout_prob': float(self.self_condition_dropout_prob),
+                'self_condition_noise_std': float(self.self_condition_noise_std),
+                'self_condition_fusion_mode': self.self_condition_fusion_mode,
                 'prediction_target_mode': self.prediction_target_mode,
                 'pref_teacher_topk': int(self.pref_teacher_topk),
                 'pref_teacher_temperature': float(self.pref_teacher_temperature),
@@ -416,6 +464,13 @@ class AdRec(nn.Module):
                 'x0_hat_low_to_target_cos': 0.0,
                 'td_teacher_to_low_cos': 0.0,
                 'td_high_low_gap': 0.0,
+                'self_condition_enabled_ratio': 0.0,
+                'self_cond_norm': 0.0,
+                'self_cond_to_target_cos': 0.0,
+                'x0_hat_base_to_target_cos': 0.0,
+                'x0_hat_sc_to_target_cos': 0.0,
+                'x0_hat_base_to_stationary_cos': 0.0,
+                'x0_hat_sc_to_stationary_cos': 0.0,
             }
             return item_tag
         stationary_anchor, anchor_shift, raw_shift_norm = self._compute_stationary_components(hist_rep, item_tag, mask_seq)
@@ -434,6 +489,11 @@ class AdRec(nn.Module):
             'td_delta_step': int(self.td_delta_step),
             'td_loss_weight': float(self.td_loss_weight),
             'td_weighting_mode': self.td_weighting_mode,
+            'self_condition_mode': self.self_condition_mode,
+            'self_condition_train_prob': float(self.self_condition_train_prob),
+            'self_condition_dropout_prob': float(self.self_condition_dropout_prob),
+            'self_condition_noise_std': float(self.self_condition_noise_std),
+            'self_condition_fusion_mode': self.self_condition_fusion_mode,
             'prediction_target_mode': self.prediction_target_mode,
             'pref_teacher_topk': int(self.pref_teacher_topk),
             'pref_teacher_temperature': float(self.pref_teacher_temperature),
@@ -470,6 +530,13 @@ class AdRec(nn.Module):
             'x0_hat_low_to_target_cos': 0.0,
             'td_teacher_to_low_cos': 0.0,
             'td_high_low_gap': 0.0,
+            'self_condition_enabled_ratio': 0.0,
+            'self_cond_norm': 0.0,
+            'self_cond_to_target_cos': 0.0,
+            'x0_hat_base_to_target_cos': 0.0,
+            'x0_hat_sc_to_target_cos': 0.0,
+            'x0_hat_base_to_stationary_cos': 0.0,
+            'x0_hat_sc_to_stationary_cos': 0.0,
         }
         return target_latent
 
@@ -623,6 +690,45 @@ class AdRec(nn.Module):
         flow_t_index = flow_t * float(max(self.num_timesteps - 1, 1))
         return flow_t, flow_t_index
 
+    def _build_self_condition_signal(self, x0_hat_base, mask_tag):
+        enabled_mask = torch.rand((x0_hat_base.size(0), 1, 1), device=x0_hat_base.device) < self.self_condition_train_prob
+        enabled_mask = enabled_mask.to(x0_hat_base.dtype)
+        self_cond = x0_hat_base.detach()
+        if self.self_condition_dropout_prob > 0:
+            keep_mask = (torch.rand_like(self_cond) > self.self_condition_dropout_prob).to(self_cond.dtype)
+            self_cond = self_cond * keep_mask / (1.0 - self.self_condition_dropout_prob)
+        if self.self_condition_noise_std > 0:
+            self_cond = self_cond + torch.randn_like(self_cond) * self.self_condition_noise_std
+        self_cond = self_cond * mask_tag.unsqueeze(-1).to(self_cond.dtype)
+        return enabled_mask, self_cond
+
+    def _update_self_condition_stats(self, enabled_mask, self_cond, x0_hat_base, x0_hat_sc, item_tag, stationary_anchor, mask_tag):
+        valid_mask = mask_tag.float()
+        target_norm = F.normalize(item_tag, dim=-1)
+        stationary_norm = F.normalize(stationary_anchor, dim=-1)
+        base_norm = F.normalize(x0_hat_base, dim=-1)
+        self.latest_stats.update({
+            'self_condition_enabled_ratio': float(enabled_mask.mean().detach().item()),
+            'x0_hat_base_to_target_cos': self._masked_mean((base_norm * target_norm).sum(dim=-1), valid_mask),
+            'x0_hat_base_to_stationary_cos': self._masked_mean((base_norm * stationary_norm).sum(dim=-1), valid_mask),
+        })
+        if self_cond is None or x0_hat_sc is None:
+            self.latest_stats.update({
+                'self_cond_norm': 0.0,
+                'self_cond_to_target_cos': 0.0,
+                'x0_hat_sc_to_target_cos': 0.0,
+                'x0_hat_sc_to_stationary_cos': 0.0,
+            })
+            return
+        self_cond_normed = F.normalize(self_cond, dim=-1)
+        sc_norm = F.normalize(x0_hat_sc, dim=-1)
+        self.latest_stats.update({
+            'self_cond_norm': self._masked_mean(self_cond.norm(dim=-1), valid_mask),
+            'self_cond_to_target_cos': self._masked_mean((self_cond_normed * target_norm).sum(dim=-1), valid_mask),
+            'x0_hat_sc_to_target_cos': self._masked_mean((sc_norm * target_norm).sum(dim=-1), valid_mask),
+            'x0_hat_sc_to_stationary_cos': self._masked_mean((sc_norm * stationary_norm).sum(dim=-1), valid_mask),
+        })
+
     def _reshape_timesteps_like_target(self, t, target_shape):
         if t.dim() == 1:
             if t.numel() == target_shape[0] * target_shape[1]:
@@ -667,12 +773,12 @@ class AdRec(nn.Module):
             t_low_matrix.reshape(-1),
             mask=mask_tag.reshape(-1),
         ).reshape_as(diff_target)
-        x0_hat_low = self.net(item_rep, x_t_low, self._scale_timesteps(t_low_matrix), mask_seq, mask_tag)
+        x0_hat_low = self.net(item_rep, x_t_low, self._scale_timesteps(t_low_matrix), mask_seq, mask_tag, self_cond=None)
 
         with torch.no_grad():
             x0_hat_high_detached = x0_hat_high.detach()
             x_tdlow_teacher = self._apply_td_step_from_high(x_t_high, x0_hat_high_detached, t_high_matrix)
-            x0_tdlow_from_high = self.net(item_rep, x_tdlow_teacher, self._scale_timesteps(t_low_matrix), mask_seq, mask_tag).detach()
+            x0_tdlow_from_high = self.net(item_rep, x_tdlow_teacher, self._scale_timesteps(t_low_matrix), mask_seq, mask_tag, self_cond=None).detach()
 
         td_weights = self._td_weight_tensor(t_low_matrix, mask_tag, x0_hat_high.dtype, x0_hat_high.device)
         td_weights = td_weights / td_weights.sum(1, keepdim=True).clamp_min(1e-6)
@@ -828,12 +934,12 @@ class AdRec(nn.Module):
         assert (posterior_mean.shape[0] == x_start.shape[0])
         return posterior_mean
 
-    def p_mean_variance(self, rep_item, x_t, t, mask_seq,mask_tag, item_embedding_weight=None):
+    def p_mean_variance(self, rep_item, x_t, t, mask_seq,mask_tag, item_embedding_weight=None, self_cond=None):
         # print("func p_mean_variance", rep_item.shape,x_t.shape)
         if self.cfg_scale==1.:
-            x0_pos = self.net(rep_item, x_t, self._scale_timesteps(t), mask_seq,mask_tag)
+            x0_pos = self.net(rep_item, x_t, self._scale_timesteps(t), mask_seq,mask_tag, self_cond=self_cond)
         else:
-            x0_pos = self.net.forward_cfg(rep_item, x_t, self._scale_timesteps(t), mask_seq, mask_tag,self.cfg_scale)
+            x0_pos = self.net.forward_cfg(rep_item, x_t, self._scale_timesteps(t), mask_seq, mask_tag,self.cfg_scale, self_cond=self_cond)
         x_0 = x0_pos
         if self.use_positive_negative_guidance and self.png_guidance_scale > 0 and item_embedding_weight is not None:
             valid_mask = mask_tag > 0
@@ -844,7 +950,7 @@ class AdRec(nn.Module):
                 valid_mask=valid_mask,
                 labels=None,
             )
-            x0_neg = self.net(negative_condition, x_t, self._scale_timesteps(t), mask_seq, mask_tag)
+            x0_neg = self.net(negative_condition, x_t, self._scale_timesteps(t), mask_seq, mask_tag, self_cond=self_cond)
             x_0 = x0_pos + self.png_guidance_scale * (x0_pos - x0_neg)
             self.latest_stats.update(negative_stats)
         # x_0 = model_output.unsqueeze(1)  ##output predict
@@ -854,17 +960,17 @@ class AdRec(nn.Module):
         model_log_variance = _extract_into_tensor(model_log_variance, t, x_t.shape)
         
         model_mean = self.q_posterior_mean_variance(x_start=x_0, x_t=x_t, t=t)  ## x_start: candidante item embedding, x_t: inputseq_embedding + outseq_noise, output x_(t-1) distribution
-        return model_mean, model_log_variance
+        return model_mean, model_log_variance, x0_pos
 
-    def p_sample(self, item_rep, noise_x_t, t, mask_seq,mask_tag, item_embedding_weight=None):
-        model_mean, model_log_variance = self.p_mean_variance(item_rep, noise_x_t, t, mask_seq,mask_tag, item_embedding_weight=item_embedding_weight)
+    def p_sample(self, item_rep, noise_x_t, t, mask_seq,mask_tag, item_embedding_weight=None, self_cond=None):
+        model_mean, model_log_variance, x0_pos = self.p_mean_variance(item_rep, noise_x_t, t, mask_seq,mask_tag, item_embedding_weight=item_embedding_weight, self_cond=self_cond)
         noise = th.randn_like(noise_x_t)
         # print("noise shape in func p_sample",noise.shape)
         nonzero_mask = (t != 0).float().unsqueeze(-1)  # no noise when t == 0
         sample_xt = model_mean + nonzero_mask * th.exp(0.5 * model_log_variance) * noise  ## sample x_{t-1} from the \mu(x_{t-1}) distribution based on the reparameter trick
         if self.geodesic:
             sample_xt = F.normalize(sample_xt,p=2,dim=-1)
-        return sample_xt
+        return sample_xt, x0_pos
 
     def denoise_sample(self, seq, tgt, mask_seq, mask_tag, item_embedding_weight=None, labels=None):
         seq = self.ag_encoder(seq, mask_seq)
@@ -902,12 +1008,14 @@ class AdRec(nn.Module):
         )
         # return self.xstart_model(item_rep, noise_x_t, th.tensor([1] * item_rep.shape[0], device=item_rep.device), mask_seq)[0]
         noise_x_t = th.randn_like(tgt)
+        prev_x0_hat = None
         indices = list(range(self.num_timesteps))[::-1]
         for i in indices: # from T to 0, reversion iteration  
             t = th.tensor([0]*(seq.shape[1]-1) + [i], device=seq.device).unsqueeze(0).repeat(seq.shape[0],1)
             noise_x_t = torch.concat([tgt[:, :-1], noise_x_t[:, -1:]], dim=1)
             # noise_x_t = torch.concat([torch.zeros_like(tgt[:, :-1]),noise_x_t[:, -1:]], dim=1)
-            noise_x_t = self.p_sample(seq, noise_x_t, t, mask_seq, mask_tag, item_embedding_weight=item_embedding_weight)
+            self_cond = prev_x0_hat.detach() if self.self_condition_mode == 'x0_prev' and prev_x0_hat is not None else None
+            noise_x_t, prev_x0_hat = self.p_sample(seq, noise_x_t, t, mask_seq, mask_tag, item_embedding_weight=item_embedding_weight, self_cond=self_cond)
         # print(noise_x_t[0,-1,:10])
         self._update_prediction_geometry_stats(
             denoised_seq=noise_x_t,
@@ -965,7 +1073,20 @@ class AdRec(nn.Module):
         if self.cfg_scale != 1:
             mask = torch.rand([mask_seq.shape[0],1,1],device=item_rep.device) > 0.7
             item_rep = torch.where(mask,torch.zeros_like(item_rep),item_rep)
-        denoised_seq = self.net(item_rep, x_t, self._scale_timesteps(t), mask_seq,mask_tag)  ##output predict
+        x0_hat_base = self.net(item_rep, x_t, self._scale_timesteps(t), mask_seq,mask_tag, self_cond=None)  ##output predict
+        enabled_mask = x0_hat_base.new_zeros((x0_hat_base.size(0), 1, 1))
+        self_cond_signal = None
+        x0_hat_sc = None
+        if self.self_condition_mode == 'x0_prev':
+            enabled_mask, self_cond_signal = self._build_self_condition_signal(x0_hat_base, mask_tag)
+            if float(enabled_mask.max().detach().item()) > 0:
+                x0_hat_sc = self.net(item_rep, x_t, self._scale_timesteps(t), mask_seq,mask_tag, self_cond=self_cond_signal)
+                denoised_seq = torch.where(enabled_mask.bool(), x0_hat_sc, x0_hat_base)
+            else:
+                denoised_seq = x0_hat_base
+        else:
+            denoised_seq = x0_hat_base
+        self._update_self_condition_stats(enabled_mask, self_cond_signal, x0_hat_base, x0_hat_sc, item_tag, stationary_anchor, mask_tag)
         td_loss = self._compute_td_consistency_loss(
             item_rep=item_rep,
             diff_target=diff_target,
