@@ -84,6 +84,9 @@ class Att_Diffuse_model(nn.Module):
         self.self_condition_dropout_prob = float(getattr(args, 'self_condition_dropout_prob', 0.1))
         self.self_condition_noise_std = float(getattr(args, 'self_condition_noise_std', 0.05))
         self.self_condition_fusion_mode = getattr(args, 'self_condition_fusion_mode', 'gated_add')
+        self.phase_target_mode = getattr(args, 'phase_target_mode', 'none')
+        self.phase_t_split = int(getattr(args, 'phase_t_split', max(getattr(args, 'diffusion_steps', 32) // 2, 1)))
+        self.phase_high_beta = float(getattr(args, 'phase_high_beta', 0.2))
         if self.item_alignment_mode not in {'ce', 'topk_kd', 'pref_ratio', 'cosine_margin_ce'}:
             raise ValueError(f"unsupported item_alignment_mode: {self.item_alignment_mode}")
         if self.item_alignment_teacher_source not in {'main_ce_head'}:
@@ -257,6 +260,9 @@ class Att_Diffuse_model(nn.Module):
             'self_condition_dropout_prob': float(self.self_condition_dropout_prob),
             'self_condition_noise_std': float(self.self_condition_noise_std),
             'self_condition_fusion_mode': self.self_condition_fusion_mode,
+            'phase_target_mode': self.phase_target_mode,
+            'phase_t_split': int(self.phase_t_split),
+            'phase_high_beta': float(self.phase_high_beta),
         }
 
     def _compute_branch_top1_acc(self, branch_seq, labels):

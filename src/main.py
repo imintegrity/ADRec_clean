@@ -29,6 +29,7 @@ def main():
         'generative_process_mode': getattr(args, 'generative_process_mode', None),
         'trajectory_consistency_mode': getattr(args, 'trajectory_consistency_mode', None),
         'self_condition_mode': getattr(args, 'self_condition_mode', None),
+        'phase_target_mode': getattr(args, 'phase_target_mode', None),
     }
     logger.info(f"Resolved recipe: {resolved_recipe}")
     print(f"Resolved recipe: {resolved_recipe}")

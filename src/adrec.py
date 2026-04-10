@@ -249,6 +249,9 @@ class AdRec(nn.Module):
         self.self_condition_dropout_prob = float(getattr(args, 'self_condition_dropout_prob', 0.1))
         self.self_condition_noise_std = float(getattr(args, 'self_condition_noise_std', 0.05))
         self.self_condition_fusion_mode = getattr(args, 'self_condition_fusion_mode', 'gated_add')
+        self.phase_target_mode = getattr(args, 'phase_target_mode', 'none')
+        self.phase_t_split = int(getattr(args, 'phase_t_split', max(self.diffusion_steps // 2, 1)))
+        self.phase_high_beta = float(getattr(args, 'phase_high_beta', 0.2))
         self.current_epoch = 0
         self.current_stationary_anchor_scale = 0.0
         self.latest_stats = {}
@@ -281,6 +284,12 @@ class AdRec(nn.Module):
             raise ValueError("self_condition_noise_std must be non-negative")
         if self.self_condition_fusion_mode not in {'gated_add'}:
             raise ValueError(f"unsupported self_condition_fusion_mode: {self.self_condition_fusion_mode}")
+        if self.phase_target_mode not in {'none', 'stationary_to_item'}:
+            raise ValueError(f"unsupported phase_target_mode: {self.phase_target_mode}")
+        if not (0 <= self.phase_t_split <= self.diffusion_steps):
+            raise ValueError("phase_t_split must be in [0, diffusion_steps]")
+        if not (0.0 <= self.phase_high_beta < 1.0):
+            raise ValueError("phase_high_beta must be in [0, 1)")
         if self.prediction_target_mode not in {'item_emb', 'pref_state'}:
             raise ValueError(f"unsupported prediction_target_mode: {self.prediction_target_mode}")
         if self.pref_teacher_temperature <= 0:
@@ -323,6 +332,19 @@ class AdRec(nn.Module):
         mask = mask.float()
         denom = mask.sum().clamp_min(1.0)
         return float((tensor * mask).sum().detach().item() / denom.detach().item())
+
+    def _phase_stats_template(self):
+        return {
+            'phase_target_mode': self.phase_target_mode,
+            'phase_t_split': int(self.phase_t_split),
+            'phase_high_beta': float(self.phase_high_beta),
+            'high_noise_phase_ratio': 0.0,
+            'low_noise_phase_ratio': 0.0,
+            'high_phase_target_to_item_cos': 0.0,
+            'high_phase_target_to_stationary_cos': 0.0,
+            'low_phase_target_to_item_cos': 0.0,
+            'low_phase_target_to_stationary_cos': 0.0,
+        }
 
     def _build_stationary_anchor(self, hist_rep, mask_seq):
         anchor_denom = mask_seq.sum(1, keepdim=True).clamp_min(1.0).unsqueeze(-1)
@@ -367,6 +389,9 @@ class AdRec(nn.Module):
             'self_condition_dropout_prob': float(self.self_condition_dropout_prob),
             'self_condition_noise_std': float(self.self_condition_noise_std),
             'self_condition_fusion_mode': self.self_condition_fusion_mode,
+            'phase_target_mode': self.phase_target_mode,
+            'phase_t_split': int(self.phase_t_split),
+            'phase_high_beta': float(self.phase_high_beta),
             'prediction_target_mode': self.prediction_target_mode,
             'pref_teacher_topk': int(self.pref_teacher_topk),
             'pref_teacher_temperature': float(self.pref_teacher_temperature),
@@ -410,6 +435,12 @@ class AdRec(nn.Module):
             'x0_hat_sc_to_target_cos': 0.0,
             'x0_hat_base_to_stationary_cos': 0.0,
             'x0_hat_sc_to_stationary_cos': 0.0,
+            'high_noise_phase_ratio': 0.0,
+            'low_noise_phase_ratio': 0.0,
+            'high_phase_target_to_item_cos': 0.0,
+            'high_phase_target_to_stationary_cos': 0.0,
+            'low_phase_target_to_item_cos': 0.0,
+            'low_phase_target_to_stationary_cos': 0.0,
         }
         return source_latent, target_latent, stationary_anchor
 
@@ -432,6 +463,9 @@ class AdRec(nn.Module):
                 'self_condition_dropout_prob': float(self.self_condition_dropout_prob),
                 'self_condition_noise_std': float(self.self_condition_noise_std),
                 'self_condition_fusion_mode': self.self_condition_fusion_mode,
+                'phase_target_mode': self.phase_target_mode,
+                'phase_t_split': int(self.phase_t_split),
+                'phase_high_beta': float(self.phase_high_beta),
                 'prediction_target_mode': self.prediction_target_mode,
                 'pref_teacher_topk': int(self.pref_teacher_topk),
                 'pref_teacher_temperature': float(self.pref_teacher_temperature),
@@ -475,6 +509,12 @@ class AdRec(nn.Module):
                 'x0_hat_sc_to_target_cos': 0.0,
                 'x0_hat_base_to_stationary_cos': 0.0,
                 'x0_hat_sc_to_stationary_cos': 0.0,
+                'high_noise_phase_ratio': 0.0,
+                'low_noise_phase_ratio': 0.0,
+                'high_phase_target_to_item_cos': 0.0,
+                'high_phase_target_to_stationary_cos': 0.0,
+                'low_phase_target_to_item_cos': 0.0,
+                'low_phase_target_to_stationary_cos': 0.0,
             }
             return item_tag
         stationary_anchor, anchor_shift, raw_shift_norm = self._compute_stationary_components(hist_rep, item_tag, mask_seq)
@@ -498,6 +538,9 @@ class AdRec(nn.Module):
             'self_condition_dropout_prob': float(self.self_condition_dropout_prob),
             'self_condition_noise_std': float(self.self_condition_noise_std),
             'self_condition_fusion_mode': self.self_condition_fusion_mode,
+            'phase_target_mode': self.phase_target_mode,
+            'phase_t_split': int(self.phase_t_split),
+            'phase_high_beta': float(self.phase_high_beta),
             'prediction_target_mode': self.prediction_target_mode,
             'pref_teacher_topk': int(self.pref_teacher_topk),
             'pref_teacher_temperature': float(self.pref_teacher_temperature),
@@ -541,6 +584,12 @@ class AdRec(nn.Module):
             'x0_hat_sc_to_target_cos': 0.0,
             'x0_hat_base_to_stationary_cos': 0.0,
             'x0_hat_sc_to_stationary_cos': 0.0,
+            'high_noise_phase_ratio': 0.0,
+            'low_noise_phase_ratio': 0.0,
+            'high_phase_target_to_item_cos': 0.0,
+            'high_phase_target_to_stationary_cos': 0.0,
+            'low_phase_target_to_item_cos': 0.0,
+            'low_phase_target_to_stationary_cos': 0.0,
         }
         return target_latent
 
@@ -625,6 +674,45 @@ class AdRec(nn.Module):
         })
         return z_pref_teacher, stationary_anchor
 
+    def _build_phase_targets(self, item_tag, stationary_anchor, mask_tag):
+        z_item = self._normalize_with_mask(item_tag, mask_tag)
+        if self.phase_target_mode != 'stationary_to_item':
+            return z_item, z_item
+        z_phase_high = (1.0 - self.phase_high_beta) * item_tag + self.phase_high_beta * stationary_anchor.expand_as(item_tag)
+        z_phase_high = self._normalize_with_mask(z_phase_high, mask_tag)
+        return z_item, z_phase_high
+
+    def _sample_diffusion_timesteps(self, target, mask):
+        if self.independent_diffusion:
+            t, _ = self.schedule_sampler.sample(target.shape[0] * target.shape[1], target.device)
+            t = t * mask.reshape(-1).long()
+            return t.reshape(target.shape[0], target.shape[1])
+        t, _ = self.schedule_sampler.sample(target.shape[0], target.device)
+        return t.unsqueeze(-1).expand(-1, target.shape[1])
+
+    def _apply_phase_targets(self, base_target, z_item, z_phase_high, t_matrix, mask_tag, stationary_anchor):
+        valid_mask = mask_tag > 0
+        if self.phase_target_mode != 'stationary_to_item':
+            self.latest_stats.update(self._phase_stats_template())
+            return base_target
+
+        high_mask = (t_matrix >= self.phase_t_split) & valid_mask
+        low_mask = valid_mask & (~high_mask)
+        phase_target = torch.where(high_mask.unsqueeze(-1), z_phase_high, z_item)
+        stationary_expanded = self._normalize_with_mask(stationary_anchor.expand_as(z_item), mask_tag)
+        self.latest_stats.update({
+            'phase_target_mode': self.phase_target_mode,
+            'phase_t_split': int(self.phase_t_split),
+            'phase_high_beta': float(self.phase_high_beta),
+            'high_noise_phase_ratio': self._masked_mean(high_mask.float(), valid_mask.float()),
+            'low_noise_phase_ratio': self._masked_mean(low_mask.float(), valid_mask.float()),
+            'high_phase_target_to_item_cos': self._masked_mean((z_phase_high * z_item).sum(dim=-1), high_mask.float()),
+            'high_phase_target_to_stationary_cos': self._masked_mean((z_phase_high * stationary_expanded).sum(dim=-1), high_mask.float()),
+            'low_phase_target_to_item_cos': self._masked_mean((z_item * z_item).sum(dim=-1), low_mask.float()),
+            'low_phase_target_to_stationary_cos': self._masked_mean((z_item * stationary_expanded).sum(dim=-1), low_mask.float()),
+        })
+        return phase_target
+
     def _compute_x0_item_top1_acc(self, x0_seq, labels, item_embedding_weight, valid_mask):
         if item_embedding_weight is None or labels is None or not valid_mask.any():
             return 0.0
@@ -659,6 +747,27 @@ class AdRec(nn.Module):
             'z_pref_hat_to_target_cos': self._masked_mean(target_cos, valid_mask_float),
             'z_pref_hat_to_stationary_cos': self._masked_mean(stationary_cos, valid_mask_float),
             'x0_item_top1_acc': float(self._compute_x0_item_top1_acc(denoised_seq, labels, item_embedding_weight, valid_mask)),
+        })
+
+    def _update_phase_alignment_stats(self, denoised_seq, z_item, phase_target, t_matrix, mask_tag):
+        valid_mask = mask_tag > 0
+        if not valid_mask.any():
+            self.latest_stats.update({
+                'x0_hat_high_to_target_cos': 0.0,
+                'x0_hat_low_to_target_cos': 0.0,
+            })
+            return
+        x0_norm = F.normalize(denoised_seq, dim=-1)
+        item_norm = F.normalize(z_item, dim=-1)
+        phase_norm = F.normalize(phase_target, dim=-1)
+        high_mask = ((t_matrix >= self.phase_t_split) & valid_mask).float()
+        low_mask = (((t_matrix < self.phase_t_split) & valid_mask)).float()
+        if self.phase_target_mode == 'none':
+            high_mask = valid_mask.float()
+            low_mask = valid_mask.float()
+        self.latest_stats.update({
+            'x0_hat_high_to_target_cos': self._masked_mean((x0_norm * phase_norm).sum(dim=-1), high_mask),
+            'x0_hat_low_to_target_cos': self._masked_mean((x0_norm * item_norm).sum(dim=-1), low_mask),
         })
 
     def _update_flow_stats(self, endpoint_seq, velocity_pred, velocity_target, item_tag, stationary_anchor, mask_tag, item_embedding_weight=None, labels=None):
@@ -1065,7 +1174,7 @@ class AdRec(nn.Module):
             losses = losses.sum(1).mean() * self.flow_loss_weight
             rounded_t = flow_t_index.round().long().clamp(min=0, max=self.num_timesteps - 1)
             return endpoint_seq, losses, rounded_t, None
-        diff_target, stationary_anchor = self.build_diffusion_target(
+        diff_target_base, stationary_anchor = self.build_diffusion_target(
             item_rep,
             item_tag,
             mask_seq,
@@ -1073,7 +1182,13 @@ class AdRec(nn.Module):
             item_embedding_weight=item_embedding_weight,
             labels=labels,
         )
-        x_t,t = self.independent_diffuse(diff_target, mask_tag, self.independent_diffusion)
+        z_item, z_phase_high = self._build_phase_targets(item_tag, stationary_anchor, mask_tag)
+        t = self._sample_diffusion_timesteps(diff_target_base, mask_tag)
+        diff_target = self._apply_phase_targets(diff_target_base, z_item, z_phase_high, t, mask_tag, stationary_anchor)
+        if self.independent_diffusion:
+            x_t = self.q_sample(diff_target.reshape(-1, diff_target.shape[-1]), t.reshape(-1), mask=mask_tag.reshape(-1)).reshape_as(diff_target)
+        else:
+            x_t = self.q_sample(diff_target, t[:, 0], mask=mask_tag)
         if self.cfg_scale != 1:
             mask = torch.rand([mask_seq.shape[0],1,1],device=item_rep.device) > 0.7
             item_rep = torch.where(mask,torch.zeros_like(item_rep),item_rep)
@@ -1124,6 +1239,7 @@ class AdRec(nn.Module):
             item_embedding_weight=item_embedding_weight,
             labels=labels,
         )
+        self._update_phase_alignment_stats(denoised_seq, z_item, diff_target, t, mask_tag)
         # print(denoised_seq.shape,item_tag.shape,mask_tag.shape)
         losses = F.mse_loss(denoised_seq,diff_target, reduction='none')* (mask_tag / mask_tag.sum(1,keepdim=True)).unsqueeze(-1)
         losses = losses.sum(1).mean() + td_loss
