@@ -69,18 +69,22 @@ class DenoisedModel(nn.Module):
         else:
             self.decoder = TransformerEncoder(args,num_blocks=2,norm_first=False,hidden_size=self.hidden_size)
 
-        self.time_embed = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size * 4),
-                                        SiLU(),
-                                        nn.Linear(self.hidden_size * 4, self.hidden_size)
-                                        )
-        self.self_cond_proj = nn.Linear(self.hidden_size, self.hidden_size)
-        self.self_cond_gate = nn.Linear(self.hidden_size * 2, self.hidden_size)
-
-        self.lambda_uncertainty = args.lambda_uncertainty
         if self.self_condition_mode not in {'none', 'x0_prev'}:
             raise ValueError(f"unsupported self_condition_mode: {self.self_condition_mode}")
         if self.self_condition_fusion_mode not in {'gated_add'}:
             raise ValueError(f"unsupported self_condition_fusion_mode: {self.self_condition_fusion_mode}")
+        self.time_embed = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size * 4),
+                                        SiLU(),
+                                        nn.Linear(self.hidden_size * 4, self.hidden_size)
+                                        )
+        if self.self_condition_mode == 'x0_prev':
+            self.self_cond_proj = nn.Linear(self.hidden_size, self.hidden_size)
+            self.self_cond_gate = nn.Linear(self.hidden_size * 2, self.hidden_size)
+        else:
+            self.self_cond_proj = None
+            self.self_cond_gate = None
+
+        self.lambda_uncertainty = args.lambda_uncertainty
 
 
     def timestep_embedding(self, timesteps, dim, max_period=10000):
@@ -240,7 +244,7 @@ class AdRec(nn.Module):
         self.td_delta_step = max(int(getattr(args, 'td_delta_step', 1)), 1)
         self.td_loss_weight = float(getattr(args, 'td_loss_weight', 0.05))
         self.td_weighting_mode = getattr(args, 'td_weighting_mode', 'snr')
-        self.self_condition_mode = getattr(args, 'self_condition_mode', 'x0_prev')
+        self.self_condition_mode = getattr(args, 'self_condition_mode', 'none')
         self.self_condition_train_prob = float(getattr(args, 'self_condition_train_prob', 0.5))
         self.self_condition_dropout_prob = float(getattr(args, 'self_condition_dropout_prob', 0.1))
         self.self_condition_noise_std = float(getattr(args, 'self_condition_noise_std', 0.05))

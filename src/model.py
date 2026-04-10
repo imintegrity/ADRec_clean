@@ -79,7 +79,7 @@ class Att_Diffuse_model(nn.Module):
         self.td_delta_step = max(int(getattr(args, 'td_delta_step', 1)), 1)
         self.td_loss_weight = float(getattr(args, 'td_loss_weight', 0.05))
         self.td_weighting_mode = getattr(args, 'td_weighting_mode', 'snr')
-        self.self_condition_mode = getattr(args, 'self_condition_mode', 'x0_prev')
+        self.self_condition_mode = getattr(args, 'self_condition_mode', 'none')
         self.self_condition_train_prob = float(getattr(args, 'self_condition_train_prob', 0.5))
         self.self_condition_dropout_prob = float(getattr(args, 'self_condition_dropout_prob', 0.1))
         self.self_condition_noise_std = float(getattr(args, 'self_condition_noise_std', 0.05))
